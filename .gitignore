@@ -1,0 +1,42 @@
+# Environment - NEVER COMMIT THESE!
+.env
+.env.local
+
+# Binaries
+/bin/
+/cmd/bot/bot
+*.exe
+
+# Data - databases and logs
+data/*.db
+data/*.backup
+data/logs/*.log
+data/trades.db
+data/trades.db.backup
+# Allow .gitkeep files
+!data/.gitkeep
+!data/logs/.gitkeep
+
+# Runtime files
+bot.log
+bot.out
+nohup.out
+*.pid
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Go
+*.out
+vendor/
+
+# Temporary files
+*.tmp
+*.temp
+scratch/

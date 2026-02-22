@@ -1,0 +1,728 @@
+package polymarket
+
+import (
+	"context"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
+	"math"
+	"math/big"
+	"net/http"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/djbro/polymarket-oracle-bot/internal/config"
+	"github.com/djbro/polymarket-oracle-bot/pkg/utils"
+	ethereum "github.com/ethereum/go-ethereum"
+	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/crypto"
+	"github.com/ethereum/go-ethereum/ethclient"
+	"github.com/go-resty/resty/v2"
+	// OLD SDK DISABLED - abandoned/incompatible
+	// sdkClient "github.com/mtt-labs/poly-market-sdk/client"
+	// "github.com/mtt-labs/poly-market-sdk/models"
+	// "github.com/mtt-labs/poly-market-sdk/polymarket"
+	"golang.org/x/time/rate"
+)
+
+// USDC token addresses on Polygon
+const (
+	USDCAddress       = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174" // USDC.e on Polygon
+	USDCNativeAddress = "0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359" // Native USDC on Polygon
+)
+
+// userAgentTransport wraps http.RoundTripper to inject a User-Agent header
+type userAgentTransport struct {
+	inner http.RoundTripper
+}
+
+func (t *userAgentTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
+	return t.inner.RoundTrip(req)
+}
+
+// PolymarketClient is the client for interacting with Polymarket API
+type PolymarketClient struct {
+	client      *resty.Client          // CLOB API for legacy calls
+	gammaClient *resty.Client          // Gamma API for market data
+	sdk         *polymarket.Polymarket // Official SDK for order signing
+	config      *config.Config
+	rateLimiter *rate.Limiter
+	ethClient   *ethclient.Client // PHASE 7: For gas price monitoring
+}
+
+// NewClient creates a new Polymarket API client
+func NewClient(cfg *config.Config) *PolymarketClient {
+	// CLOB API client (for legacy calls)
+	client := resty.New()
+	client.SetBaseURL(cfg.PolymarketBaseURL)
+	client.SetTimeout(30 * time.Second)
+
+	// Gamma API client (for market data)
+	gammaClient := resty.New()
+	gammaClient.SetBaseURL(cfg.PolymarketGammaURL)
+	gammaClient.SetTimeout(30 * time.Second)
+
+	// Rate limiting: max 10 requests per second
+	rateLimiter := rate.NewLimiter(rate.Every(100*time.Millisecond), 10)
+
+	// PHASE 7: Connect to Polygon RPC for gas price monitoring
+	ethClient, err := ethclient.Dial(cfg.PolygonRPCURL)
+	if err != nil {
+		utils.Logger.Warnf("Failed to connect to Polygon RPC (gas monitoring disabled): %v", err)
+		ethClient = nil
+	}
+
+	// OLD SDK DISABLED - Using official Polymarket Go packages instead
+	// See client_official.go for new implementation
+	// privateKey := strings.TrimPrefix(cfg.PolymarketPrivateKey, "0x")
+	/*
+	sdkHTTPClient := &http.Client{
+		Timeout:   30 * time.Second,
+		Transport: &userAgentTransport{inner: http.DefaultTransport},
+	}
+	sdkCfg := &sdkClient.Config{
+		PrivateKey:    privateKey,
+		ChainID:       cfg.ChainID,
+		SignatureType: sdkClient.SignatureTypePOLY_PROXY,
+		Timeout:       30 * time.Second,
+		BaseURL:       cfg.PolymarketBaseURL,
+		HTTPClient:    sdkHTTPClient,
+	}
+
+	var sdk *polymarket.Polymarket
+	sdk, err = polymarket.New(sdkCfg)
+	if err != nil {
+		utils.Logger.Warnf("Failed to initialize Polymarket SDK (trading disabled): %v", err)
+		sdk = nil
+	} else {
+	*/
+	var sdk *polymarket.Polymarket
+	sdk = nil  // Abandoned SDK disabled
+	{
+		// Try deriving existing API credentials first
+		utils.Logger.Info("🔍 DEBUG: Attempting to derive API credentials from private key...")
+		creds, credErr := sdk.Auth.DeriveAPICredentials()
+		if credErr != nil {
+			utils.Logger.Warnf("❌ DEBUG: Failed to derive API credentials: %v", credErr)
+			// Try creating new ones
+			utils.Logger.Info("🔍 DEBUG: Attempting to create new API credentials...")
+			creds, credErr = sdk.Auth.CreateOrDeriveAPICredentials()
+		}
+		if credErr != nil {
+			utils.Logger.Warnf("❌ DEBUG: Failed to create API credentials: %v", credErr)
+			// Fall back to .env credentials if available
+			if cfg.PolymarketAPIKey != "" {
+				sdk.Client.SetAPICredentials(cfg.PolymarketAPIKey, cfg.PolymarketAPISecret, cfg.PolymarketAPIPassphrase)
+				utils.Logger.Infof("⚠️  DEBUG: Using API credentials from .env file (key: %s...)", cfg.PolymarketAPIKey[:8])
+			}
+		} else {
+			sdk.Client.SetAPICredentials(creds.Key, creds.Secret, creds.Passphrase)
+			utils.Logger.Infof("✅ DEBUG: API credentials derived successfully")
+			utils.Logger.Infof("   Key: %s...", creds.Key[:8])
+			utils.Logger.Infof("   Secret length: %d chars", len(creds.Secret))
+			utils.Logger.Infof("   Passphrase length: %d chars", len(creds.Passphrase))
+		}
+		utils.Logger.Infof("🔍 DEBUG: SDK Config - SignatureType: POLY_PROXY, ChainID: %d", cfg.ChainID)
+		utils.Logger.Info("Polymarket SDK initialized for order signing")
+	}
+
+	return &PolymarketClient{
+		client:      client,
+		gammaClient: gammaClient,
+		sdk:         sdk,
+		config:      cfg,
+		rateLimiter: rateLimiter,
+		ethClient:   ethClient,
+	}
+}
+
+// ERC20 balanceOf function selector: balanceOf(address)
+var erc20BalanceOfSelector = crypto.Keccak256([]byte("balanceOf(address)"))[:4]
+
+// CheckBalanceAndAllowance logs the wallet's USDC balance for diagnostics
+func (c *PolymarketClient) CheckBalanceAndAllowance() {
+	if c.ethClient == nil {
+		utils.Logger.Warn("Eth client not available - cannot check on-chain balance")
+		return
+	}
+
+	privateKey := strings.TrimPrefix(c.config.PolymarketPrivateKey, "0x")
+	key, err := crypto.HexToECDSA(privateKey)
+	if err != nil {
+		utils.Logger.Errorf("Invalid private key: %v", err)
+		return
+	}
+	eoaWallet := crypto.PubkeyToAddress(key.PublicKey)
+	utils.Logger.Infof("EOA wallet (signer): %s", eoaWallet.Hex())
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	// Check USDC balances on both EOA and proxy wallet
+	proxyWallet := common.HexToAddress("0xd87528A57440f60B0d5DF027826485C46DdB1c89")
+	utils.Logger.Infof("Polymarket proxy wallet: %s", proxyWallet.Hex())
+
+	usdcTokens := map[string]string{"USDC.e": USDCAddress, "USDC": USDCNativeAddress}
+	for name, addr := range usdcTokens {
+		token := common.HexToAddress(addr)
+
+		// EOA balance
+		eoaBal := c.callBalanceOf(ctx, token, eoaWallet)
+		if eoaBal != nil {
+			balFloat := new(big.Float).Quo(new(big.Float).SetInt(eoaBal), big.NewFloat(1e6))
+			utils.Logger.Infof("  EOA %s: $%s", name, balFloat.Text('f', 2))
+		}
+
+		// Proxy wallet balance
+		proxyBal := c.callBalanceOf(ctx, token, proxyWallet)
+		if proxyBal != nil {
+			balFloat := new(big.Float).Quo(new(big.Float).SetInt(proxyBal), big.NewFloat(1e6))
+			utils.Logger.Infof("  Proxy %s: $%s", name, balFloat.Text('f', 2))
+		}
+	}
+}
+
+func (c *PolymarketClient) callBalanceOf(ctx context.Context, token, owner common.Address) *big.Int {
+	data := append([]byte{}, erc20BalanceOfSelector...)
+	data = append(data, common.LeftPadBytes(owner.Bytes(), 32)...)
+	result, err := c.ethClient.CallContract(ctx, ethereum.CallMsg{To: &token, Data: data}, nil)
+	if err != nil || len(result) < 32 {
+		return nil
+	}
+	return new(big.Int).SetBytes(result[:32])
+}
+
+// EnsureAllowance checks balance/allowance via the CLOB API and attempts to update if needed.
+func (c *PolymarketClient) EnsureAllowance() error {
+	if c.sdk == nil {
+		return fmt.Errorf("SDK not initialized")
+	}
+
+	utils.Logger.Info("Checking token allowances...")
+
+	// Check COLLATERAL (USDC) balance and allowance via CLOB API
+	c.rateLimiter.Wait(context.Background())
+	req := c.client.R()
+
+	utils.Logger.Info("🔍 DEBUG: Checking balance via CLOB API...")
+	utils.Logger.Debugf("   Endpoint: /balance-allowance?asset_type=COLLATERAL")
+
+	c.addAuthHeaders(req, "GET", "/balance-allowance?asset_type=COLLATERAL", "")
+
+	// Log the auth headers being sent (redacted)
+	utils.Logger.Debugf("   Headers: POLY-API-KEY=%s...", req.Header.Get("POLY-API-KEY")[:8])
+	utils.Logger.Debugf("   Headers: POLY-SIGNATURE=%s...", req.Header.Get("POLY-SIGNATURE")[:16])
+	utils.Logger.Debugf("   Headers: POLY-TIMESTAMP=%s", req.Header.Get("POLY-TIMESTAMP"))
+
+	resp, err := req.Get("/balance-allowance?asset_type=COLLATERAL")
+	if err == nil && !resp.IsError() {
+		utils.Logger.Infof("✅ DEBUG: CLOB balance check succeeded: %s", resp.String())
+	} else if err != nil {
+		utils.Logger.Warnf("❌ DEBUG: Balance check network error: %v", err)
+	} else {
+		utils.Logger.Warnf("❌ DEBUG: Balance check HTTP error: %s - %s", resp.Status(), resp.String())
+		utils.Logger.Warnf("   This means API authentication is failing!")
+	}
+
+	// Check CONDITIONAL token allowance
+	c.rateLimiter.Wait(context.Background())
+	req2 := c.client.R()
+	c.addAuthHeaders(req2, "GET", "/balance-allowance?asset_type=CONDITIONAL", "")
+	resp2, err := req2.Get("/balance-allowance?asset_type=CONDITIONAL")
+	if err == nil && !resp2.IsError() {
+		utils.Logger.Infof("CLOB conditional allowance: %s", resp2.String())
+	}
+
+	return nil
+}
+
+// sign creates HMAC signature for authenticated requests
+func (c *PolymarketClient) sign(timestamp, method, path, body string) string {
+	message := timestamp + method + path + body
+	h := hmac.New(sha256.New, []byte(c.config.PolymarketAPISecret))
+	h.Write([]byte(message))
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+// addAuthHeaders adds authentication headers to the request
+func (c *PolymarketClient) addAuthHeaders(req *resty.Request, method, path, body string) {
+	timestamp := strconv.FormatInt(time.Now().Unix(), 10)
+	signature := c.sign(timestamp, method, path, body)
+
+	req.SetHeaders(map[string]string{
+		"POLY-API-KEY":        c.config.PolymarketAPIKey,
+		"POLY-SIGNATURE":      signature,
+		"POLY-TIMESTAMP":      timestamp,
+		"POLY-PASSPHRASE":     c.config.PolymarketAPIPassphrase,
+		"Content-Type":        "application/json",
+	})
+}
+
+// GetActiveMarkets fetches all active markets from Gamma API with pagination
+func (c *PolymarketClient) GetActiveMarkets() ([]Market, error) {
+	const pageSize = 500
+	var allMarkets []Market
+
+	for offset := 0; ; offset += pageSize {
+		c.rateLimiter.Wait(context.Background())
+
+		var page []Market
+		resp, err := c.gammaClient.R().
+			SetResult(&page).
+			Get(fmt.Sprintf("/markets?closed=false&limit=%d&offset=%d", pageSize, offset))
+
+		if err != nil {
+			return nil, fmt.Errorf("failed to get active markets (offset %d): %w", offset, err)
+		}
+
+		if resp.IsError() {
+			return nil, fmt.Errorf("API error (offset %d): %s", offset, resp.Status())
+		}
+
+		if len(page) == 0 {
+			break
+		}
+
+		allMarkets = append(allMarkets, page...)
+
+		// If we got fewer than pageSize, we've reached the end
+		if len(page) < pageSize {
+			break
+		}
+	}
+
+	// Set fetch timestamp and parse JSON string fields for all markets
+	fetchTime := time.Now()
+	for i := range allMarkets {
+		allMarkets[i].FetchedAt = fetchTime
+
+		// Parse outcomes from JSON string
+		if allMarkets[i].OutcomesStr != "" {
+			allMarkets[i].Outcomes = parseJSONStringArray(allMarkets[i].OutcomesStr)
+		}
+
+		// Parse token IDs from JSON string
+		if allMarkets[i].TokenIDsStr != "" {
+			allMarkets[i].TokenIDs = parseJSONStringArray(allMarkets[i].TokenIDsStr)
+		}
+
+		// Parse outcome prices from JSON string to float array
+		if allMarkets[i].OutcomePricesStr != "" {
+			allMarkets[i].Prices = parseOutcomePrices(allMarkets[i].OutcomePricesStr)
+		}
+	}
+
+	return allMarkets, nil
+}
+
+// parseJSONStringArray parses a JSON-encoded string array
+func parseJSONStringArray(str string) []string {
+	var result []string
+	if err := json.Unmarshal([]byte(str), &result); err != nil {
+		return []string{}
+	}
+	return result
+}
+
+// parseOutcomePrices parses the outcome prices string from Gamma API
+func parseOutcomePrices(pricesStr string) []float64 {
+	// Try to parse as JSON array
+	var prices []string
+	if err := json.Unmarshal([]byte(pricesStr), &prices); err != nil {
+		return []float64{}
+	}
+
+	// Convert strings to floats
+	result := make([]float64, 0, len(prices))
+	for _, priceStr := range prices {
+		if price, err := strconv.ParseFloat(priceStr, 64); err == nil {
+			result = append(result, price)
+		}
+	}
+
+	return result
+}
+
+// GetMarketByID fetches a specific market by ID from Gamma API
+func (c *PolymarketClient) GetMarketByID(marketID string) (*Market, error) {
+	c.rateLimiter.Wait(context.Background())
+
+	// Gamma API returns single market as object
+	var market Market
+	resp, err := c.gammaClient.R().
+		SetResult(&market).
+		Get(fmt.Sprintf("/markets/%s", marketID))
+
+	if err != nil {
+		return nil, fmt.Errorf("failed to get market: %w", err)
+	}
+
+	if resp.IsError() {
+		return nil, fmt.Errorf("API error: %s", resp.Status())
+	}
+
+	// Set fetch timestamp and parse JSON string fields
+	market.FetchedAt = time.Now()
+	if market.OutcomesStr != "" {
+		market.Outcomes = parseJSONStringArray(market.OutcomesStr)
+	}
+	if market.TokenIDsStr != "" {
+		market.TokenIDs = parseJSONStringArray(market.TokenIDsStr)
+	}
+	if market.OutcomePricesStr != "" {
+		market.Prices = parseOutcomePrices(market.OutcomePricesStr)
+	}
+
+	return &market, nil
+}
+
+// GetOrderbook fetches the orderbook for a market
+func (c *PolymarketClient) GetOrderbook(marketID string) (*Orderbook, error) {
+	c.rateLimiter.Wait(context.Background())
+
+	var orderbook Orderbook
+	resp, err := c.client.R().
+		SetResult(&orderbook).
+		SetPathParam("id", marketID).
+		Get("/markets/{id}/orderbook")
+
+	if err != nil {
+		return nil, fmt.Errorf("failed to get orderbook: %w", err)
+	}
+
+	if resp.IsError() {
+		return nil, fmt.Errorf("API error: %s", resp.Status())
+	}
+
+	return &orderbook, nil
+}
+
+// refreshCredentials re-derives API credentials from the private key
+func (c *PolymarketClient) refreshCredentials() error {
+	if c.sdk == nil {
+		return fmt.Errorf("SDK not initialized")
+	}
+
+	utils.Logger.Info("Refreshing API credentials...")
+
+	// Try deriving existing credentials first (doesn't create new ones)
+	creds, err := c.sdk.Auth.DeriveAPICredentials()
+	if err == nil && creds != nil {
+		c.sdk.Client.SetAPICredentials(creds.Key, creds.Secret, creds.Passphrase)
+		utils.Logger.Infof("API credentials derived (key: %s...)", creds.Key[:8])
+		return nil
+	}
+	utils.Logger.Warnf("Derive failed: %v, trying .env fallback...", err)
+
+	// Fall back to .env credentials
+	if c.config.PolymarketAPIKey != "" {
+		c.sdk.Client.SetAPICredentials(c.config.PolymarketAPIKey, c.config.PolymarketAPISecret, c.config.PolymarketAPIPassphrase)
+		utils.Logger.Info("Using API credentials from .env file")
+		return nil
+	}
+
+	return fmt.Errorf("failed to refresh credentials: %w", err)
+}
+
+// PlaceMarketOrder places an order using the Polymarket SDK with proper signing
+// size is the dollar amount to spend; it gets converted to shares (size / price)
+func (c *PolymarketClient) PlaceMarketOrder(tokenID string, price, size float64) error {
+	if c.sdk == nil {
+		return fmt.Errorf("Polymarket SDK not initialized - cannot place orders")
+	}
+
+	if price <= 0 {
+		return fmt.Errorf("invalid price: %.4f", price)
+	}
+
+	// Convert dollar amount to number of shares
+	shares := size / price
+
+	// Round to Polymarket's required decimal precision using string formatting
+	// to avoid floating point precision errors
+	// Maker amount (shares): max 4 decimals
+	// Taker amount (USDC): max 2 decimals
+	// Price: max 4 decimals
+	priceStr := fmt.Sprintf("%.4f", price)
+	sharesStr := fmt.Sprintf("%.4f", shares)
+	sizeStr := fmt.Sprintf("%.2f", size)
+
+	price, _ = strconv.ParseFloat(priceStr, 64)
+	shares, _ = strconv.ParseFloat(sharesStr, 64)
+	size, _ = strconv.ParseFloat(sizeStr, 64)
+
+	// Additional truncation to ensure no floating point artifacts
+	price = math.Floor(price*10000) / 10000    // Truncate to exactly 4 decimals
+	shares = math.Floor(shares*10000) / 10000  // Truncate to exactly 4 decimals
+	size = math.Floor(size*100) / 100          // Truncate to exactly 2 decimals
+
+	c.rateLimiter.Wait(context.Background())
+
+	utils.Logger.Infof("Placing order: tokenID=%s, price=%.4f, size=$%.2f (%.4f shares)", tokenID, price, size, shares)
+
+	orderResp, err := c.sdk.Orders.CreateAndPostOrder(
+		&models.CreateAndPostOrderParams{
+			TokenID: tokenID,
+			Price:   price,
+			Side:    0, // 0 = BUY
+			Size:    size, // Size is the dollar amount, not shares
+		},
+		&models.CreateAndPostOrderConfig{}, // Auto-fetch tickSize and negRisk
+		models.OrderTypeGTC,
+	)
+
+	// Retry once with refreshed credentials on 401
+	if err != nil && strings.Contains(err.Error(), "401") {
+		utils.Logger.Warn("Got 401 - refreshing API credentials and retrying...")
+		if refreshErr := c.refreshCredentials(); refreshErr != nil {
+			return fmt.Errorf("failed to place order: %w (credential refresh also failed: %v)", err, refreshErr)
+		}
+
+		c.rateLimiter.Wait(context.Background())
+		orderResp, err = c.sdk.Orders.CreateAndPostOrder(
+			&models.CreateAndPostOrderParams{
+				TokenID: tokenID,
+				Price:   price,
+				Side:    0,
+				Size:    shares,
+			},
+			&models.CreateAndPostOrderConfig{},
+			models.OrderTypeGTC,
+		)
+	}
+
+	if err != nil {
+		return fmt.Errorf("failed to place order: %w", err)
+	}
+
+	if !orderResp.Success {
+		return fmt.Errorf("order rejected: %s", orderResp.ErrorMsg)
+	}
+
+	utils.Logger.Infof("✅ Order placed: ID=%s, Status=%s", orderResp.OrderID, orderResp.Status)
+	return nil
+}
+
+// PlaceSellOrder places a SELL order using the Polymarket SDK with proper signing
+// size is the dollar amount; it gets converted to shares (size / price)
+func (c *PolymarketClient) PlaceSellOrder(tokenID string, price, size float64) error {
+	if c.sdk == nil {
+		return fmt.Errorf("Polymarket SDK not initialized - cannot place orders")
+	}
+
+	if price <= 0 {
+		return fmt.Errorf("invalid price: %.4f", price)
+	}
+
+	// Convert dollar amount to number of shares
+	shares := size / price
+
+	// Round to Polymarket's required decimal precision using string formatting
+	// to avoid floating point precision errors
+	// Maker amount (shares): max 4 decimals
+	// Taker amount (USDC): max 2 decimals
+	// Price: max 4 decimals
+	priceStr := fmt.Sprintf("%.4f", price)
+	sharesStr := fmt.Sprintf("%.4f", shares)
+	sizeStr := fmt.Sprintf("%.2f", size)
+
+	price, _ = strconv.ParseFloat(priceStr, 64)
+	shares, _ = strconv.ParseFloat(sharesStr, 64)
+	size, _ = strconv.ParseFloat(sizeStr, 64)
+
+	// Additional truncation to ensure no floating point artifacts
+	price = math.Floor(price*10000) / 10000    // Truncate to exactly 4 decimals
+	shares = math.Floor(shares*10000) / 10000  // Truncate to exactly 4 decimals
+	size = math.Floor(size*100) / 100          // Truncate to exactly 2 decimals
+
+	c.rateLimiter.Wait(context.Background())
+
+	utils.Logger.Infof("Placing SELL order: tokenID=%s, price=%.4f, size=$%.2f (%.4f shares)", tokenID, price, size, shares)
+
+	orderResp, err := c.sdk.Orders.CreateAndPostOrder(
+		&models.CreateAndPostOrderParams{
+			TokenID: tokenID,
+			Price:   price,
+			Side:    1, // 1 = SELL
+			Size:    size, // Size is the dollar amount, not shares
+		},
+		&models.CreateAndPostOrderConfig{},
+		models.OrderTypeGTC,
+	)
+
+	// Retry once with refreshed credentials on 401
+	if err != nil && strings.Contains(err.Error(), "401") {
+		utils.Logger.Warn("Got 401 - refreshing API credentials and retrying...")
+		if refreshErr := c.refreshCredentials(); refreshErr != nil {
+			return fmt.Errorf("failed to place sell order: %w (credential refresh also failed: %v)", err, refreshErr)
+		}
+
+		c.rateLimiter.Wait(context.Background())
+		orderResp, err = c.sdk.Orders.CreateAndPostOrder(
+			&models.CreateAndPostOrderParams{
+				TokenID: tokenID,
+				Price:   price,
+				Side:    1,
+				Size:    shares,
+			},
+			&models.CreateAndPostOrderConfig{},
+			models.OrderTypeGTC,
+		)
+	}
+
+	if err != nil {
+		return fmt.Errorf("failed to place sell order: %w", err)
+	}
+
+	if !orderResp.Success {
+		return fmt.Errorf("sell order rejected: %s", orderResp.ErrorMsg)
+	}
+
+	utils.Logger.Infof("✅ Sell order placed: ID=%s, Status=%s", orderResp.OrderID, orderResp.Status)
+	return nil
+}
+
+// GetBalance fetches the user's current balance
+func (c *PolymarketClient) GetBalance() (float64, error) {
+	c.rateLimiter.Wait(context.Background())
+
+	req := c.client.R()
+	c.addAuthHeaders(req, "GET", "/balance", "")
+
+	var balance Balance
+	resp, err := req.SetResult(&balance).Get("/balance")
+
+	if err != nil {
+		return 0, fmt.Errorf("failed to get balance: %w", err)
+	}
+
+	if resp.IsError() {
+		return 0, fmt.Errorf("API error: %s", resp.Status())
+	}
+
+	return balance.USD, nil
+}
+
+// GetGasPrice fetches current gas price from Polygon network
+// PHASE 7: Gas price monitoring for cost optimization
+func (c *PolymarketClient) GetGasPrice() (*big.Int, error) {
+	if c.ethClient == nil {
+		return nil, fmt.Errorf("eth client not initialized")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	gasPrice, err := c.ethClient.SuggestGasPrice(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get gas price: %w", err)
+	}
+
+	return gasPrice, nil
+}
+
+// ShouldExecuteTrade checks if trade is profitable after gas costs
+// PHASE 7: Prevents executing trades when gas is too expensive
+func (c *PolymarketClient) ShouldExecuteTrade(expectedProfit, positionSize float64) (bool, string) {
+	// Skip gas check if eth client not available
+	if c.ethClient == nil {
+		return true, ""
+	}
+
+	gasPrice, err := c.GetGasPrice()
+	if err != nil {
+		// Don't block trading if gas check fails
+		utils.Logger.Debugf("Gas price check failed (proceeding anyway): %v", err)
+		return true, ""
+	}
+
+	// Estimate gas cost for trade execution (approx. 200k gas on Polygon)
+	const estimatedGas = 200000
+	gasCostWei := new(big.Int).Mul(gasPrice, big.NewInt(estimatedGas))
+
+	// Convert Wei to Gwei for logging
+	gasCostGwei := new(big.Int).Div(gasCostWei, big.NewInt(1e9))
+
+	// Rough conversion: Gwei to USD (simplified - actual rate varies)
+	// On Polygon, gas is typically <0.01 MATIC, which is ~$0.01 USD
+	// For simplicity, we'll use: gasCostUSD = gasCostGwei / 1e9 * maticPrice
+	// Assuming ~$1 MATIC (adjust based on actual price)
+	const maticPriceUSD = 1.0
+	gasCostUSD := float64(gasCostGwei.Int64()) / 1e9 * maticPriceUSD
+
+	utils.Logger.Debugf("Gas cost estimate: %s Gwei (~$%.4f)", gasCostGwei.String(), gasCostUSD)
+
+	// Calculate profit after costs
+	// Note: Polymarket fees (3.15%) are already deducted in expectedProfit calculation
+	profitUSD := expectedProfit * positionSize
+	netProfit := profitUSD - gasCostUSD
+
+	// Execute as long as we still make a profit after all costs
+	if netProfit <= 0 {
+		return false, fmt.Sprintf("costs exceed profit: gas=$%.4f, expected profit=$%.4f, net=$%.4f",
+			gasCostUSD, profitUSD, netProfit)
+	}
+
+	utils.Logger.Infof("✅ Trade profitable: gas=$%.4f, expected profit=$%.4f, net profit=$%.4f",
+		gasCostUSD, profitUSD, netProfit)
+	return true, ""
+}
+
+// CreateSplitPosition creates a split position (lock $1 USDC → get 1 YES + 1 NO token)
+// PHASE 8: For SHORT parity arbitrage
+func (c *PolymarketClient) CreateSplitPosition(marketID string, amount float64) error {
+	c.rateLimiter.Wait(context.Background())
+
+	splitReq := map[string]interface{}{
+		"market_id": marketID,
+		"amount":    amount,
+	}
+
+	req := c.client.R().SetBody(splitReq)
+	c.addAuthHeaders(req, "POST", "/split", "")
+
+	var response map[string]interface{}
+	resp, err := req.SetResult(&response).Post("/split")
+
+	if err != nil {
+		return fmt.Errorf("failed to create split position: %w", err)
+	}
+
+	if resp.IsError() {
+		return fmt.Errorf("API error creating split: %s", resp.Status())
+	}
+
+	utils.Logger.Infof("Split position created: %d YES + %d NO tokens", int(amount), int(amount))
+	return nil
+}
+
+// MergeSplitPosition merges YES + NO tokens back to USDC (reverse of split)
+// PHASE 8: For closing parity positions if needed
+func (c *PolymarketClient) MergeSplitPosition(marketID string, amount float64) error {
+	c.rateLimiter.Wait(context.Background())
+
+	mergeReq := map[string]interface{}{
+		"market_id": marketID,
+		"amount":    amount,
+	}
+
+	req := c.client.R().SetBody(mergeReq)
+	c.addAuthHeaders(req, "POST", "/merge", "")
+
+	var response map[string]interface{}
+	resp, err := req.SetResult(&response).Post("/merge")
+
+	if err != nil {
+		return fmt.Errorf("failed to merge position: %w", err)
+	}
+
+	if resp.IsError() {
+		return fmt.Errorf("API error merging: %s", resp.Status())
+	}
+
+	return nil
+}
