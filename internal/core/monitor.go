@@ -113,8 +113,72 @@ func (m *MarketMonitor) CategorizeMarket(market polymarket.Market) string {
 	// Auto-detect from question (lowercase once for efficiency)
 	question := strings.ToLower(market.Question)
 
-	// Check each category's keywords (order matters - check more specific first)
+	// POSITIVE WEATHER PATTERN MATCHING - only match very specific weather questions
+	isWeather := false
+
+	// Pattern 1: Temperature questions with degrees/temperature
+	if (strings.Contains(question, "temperature") || strings.Contains(question, "degrees") ||
+		strings.Contains(question, "°c") || strings.Contains(question, "°f")) &&
+		!strings.Contains(question, "global temperature") { // Exclude climate change markets for now
+		// Check for city names (common weather markets)
+		cities := []string{"london", "new york", "chicago", "los angeles", "seattle", "miami",
+			"paris", "tokyo", "sydney", "beijing", "delhi", "moscow"}
+		for _, city := range cities {
+			if strings.Contains(question, city) {
+				isWeather = true
+				break
+			}
+		}
+	}
+
+	// Pattern 2: Hurricane/storm formation (not team names)
+	if !isWeather {
+		if (strings.Contains(question, "hurricane") || strings.Contains(question, "tropical storm")) &&
+			(strings.Contains(question, "landfall") || strings.Contains(question, "form") ||
+				strings.Contains(question, "category")) &&
+			!strings.Contains(question, "hurricanes") { // Exclude team (plural)
+			isWeather = true
+		}
+	}
+
+	// Pattern 3: Named storms
+	if !isWeather {
+		if strings.Contains(question, "named storm") {
+			isWeather = true
+		}
+	}
+
+	// Pattern 4: Rain in specific cities
+	if !isWeather {
+		if (strings.Contains(question, " rain ") || strings.Contains(question, " rain?") ||
+			strings.Contains(question, "raining")) {
+			// Exclude false positives
+			if !strings.Contains(question, "ukraine") && !strings.Contains(question, "train") &&
+				!strings.Contains(question, "drain") && !strings.Contains(question, "brain") &&
+				!strings.Contains(question, "character of rain") {
+				isWeather = true
+			}
+		}
+	}
+
+	// Pattern 5: Snow questions
+	if !isWeather {
+		if (strings.Contains(question, " snow ") || strings.Contains(question, " snow?") ||
+			strings.Contains(question, "snowing")) &&
+			!strings.Contains(question, "snowflake") && !strings.Contains(question, "snow ") {
+			isWeather = true
+		}
+	}
+
+	if isWeather {
+		return "weather"
+	}
+
+	// Check other categories
 	for category, keywords := range m.categoryKeywords {
+		if category == "weather" {
+			continue // Already handled above
+		}
 		for _, keyword := range keywords {
 			if strings.Contains(question, keyword) {
 				return category
