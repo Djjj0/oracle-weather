@@ -3,7 +3,7 @@ package resolvers
 import (
 	"time"
 
-	"github.com/djbro/polymarket-oracle-bot/pkg/polymarket"
+	"github.com/djbro/oracle-weather/pkg/polymarket"
 )
 
 // Resolver is the interface that all market resolvers must implement
@@ -33,6 +33,12 @@ type MarketData struct {
 	Teams       []string               // For sports
 	Sport       string                 // Sport type (NBA, NFL, etc.)
 	Extra       map[string]interface{} // Additional parsed data
+}
+
+// CachedResult stores outcome and confidence for caching
+type CachedResult struct {
+	Outcome    string
+	Confidence float64
 }
 
 // BaseResolver provides common functionality for all resolvers

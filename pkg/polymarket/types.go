@@ -3,7 +3,7 @@ package polymarket
 import (
 	"time"
 
-	"github.com/djbro/polymarket-oracle-bot/internal/config"
+	"github.com/djbro/oracle-weather/internal/config"
 )
 
 // Market represents a Polymarket prediction market

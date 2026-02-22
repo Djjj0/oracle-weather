@@ -9,7 +9,7 @@ import (
 	"path/filepath"
 	"time"
 
-	"github.com/djbro/polymarket-oracle-bot/pkg/utils"
+	"github.com/djbro/oracle-weather/pkg/utils"
 )
 
 // PythonOrderRequest represents the input to the Python order script

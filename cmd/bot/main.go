@@ -88,7 +88,7 @@ func main() {
 	fmt.Printf("Weather Oracle Lag:\n")
 	fmt.Printf("  Min Edge Threshold: %.2f%%\n", cfg.MinProfitThreshold*100)
 	fmt.Printf("  Max Position Size: $%.2f\n", cfg.MaxPositionSize)
-	fmt.Printf("  Check Interval: %ds\n", cfg.CheckIntervalSeconds)
+	fmt.Printf("  Check Interval: %ds\n", cfg.CheckInterval)
 	fmt.Printf("\n")
 	fmt.Printf("Weather Data Source:\n")
 	fmt.Printf("  IEM ASOS (matches Polymarket's Weather Underground)\n")
@@ -96,7 +96,7 @@ func main() {
 	fmt.Printf("Market Filters:\n")
 	fmt.Printf("  Min Liquidity: $%.2f\n", cfg.MinLiquidity)
 	fmt.Printf("  Min Volume: $%.2f\n", cfg.MinVolume)
-	fmt.Printf("  Min Market Age: %dh\n", cfg.MinMarketAgeHours)
+	fmt.Printf("  Min Market Age: %dh\n", cfg.MinMarketAge)
 	fmt.Printf("  Max Spread: %.2f%%\n", cfg.MaxSpread*100)
 	fmt.Printf("\n")
 	fmt.Printf("General:\n")
@@ -140,7 +140,7 @@ func main() {
 
 	// Start oracle lag strategy
 	go func() {
-		ticker := time.NewTicker(time.Duration(cfg.CheckIntervalSeconds) * time.Second)
+		ticker := time.NewTicker(time.Duration(cfg.CheckInterval) * time.Second)
 		defer ticker.Stop()
 
 		for {

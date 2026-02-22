@@ -7,9 +7,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/djbro/polymarket-oracle-bot/internal/config"
-	"github.com/djbro/polymarket-oracle-bot/pkg/polymarket"
-	"github.com/djbro/polymarket-oracle-bot/pkg/utils"
+	"github.com/djbro/oracle-weather/internal/config"
+	"github.com/djbro/oracle-weather/pkg/polymarket"
+	"github.com/djbro/oracle-weather/pkg/utils"
 	"github.com/go-resty/resty/v2"
 )
 

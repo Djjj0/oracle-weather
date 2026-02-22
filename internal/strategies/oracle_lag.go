@@ -10,12 +10,12 @@ import (
 	"sync"
 	"time"
 
-	"github.com/djbro/polymarket-oracle-bot/internal/config"
-	"github.com/djbro/polymarket-oracle-bot/internal/core"
-	"github.com/djbro/polymarket-oracle-bot/internal/database"
-	"github.com/djbro/polymarket-oracle-bot/internal/resolvers"
-	"github.com/djbro/polymarket-oracle-bot/pkg/polymarket"
-	"github.com/djbro/polymarket-oracle-bot/pkg/utils"
+	"github.com/djbro/oracle-weather/internal/config"
+	"github.com/djbro/oracle-weather/internal/core"
+	"github.com/djbro/oracle-weather/internal/database"
+	"github.com/djbro/oracle-weather/internal/resolvers"
+	"github.com/djbro/oracle-weather/pkg/polymarket"
+	"github.com/djbro/oracle-weather/pkg/utils"
 	bolt "go.etcd.io/bbolt"
 )
 

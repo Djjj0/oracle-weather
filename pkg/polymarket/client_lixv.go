@@ -10,8 +10,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/djbro/polymarket-oracle-bot/internal/config"
-	"github.com/djbro/polymarket-oracle-bot/pkg/utils"
+	"github.com/djbro/oracle-weather/internal/config"
+	"github.com/djbro/oracle-weather/pkg/utils"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/ethclient"
