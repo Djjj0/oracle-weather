@@ -355,14 +355,10 @@ func (c *PolymarketClientLixv) PlaceOrder(signedOrder *model.SignedOrder) error 
 func (c *PolymarketClientLixv) GetBalance() (float64, error) {
 	c.rateLimiter.Wait(context.Background())
 
-	// Test authentication by getting account status
-	_, err := c.clobClient.GetClosedOnlyMode()
-	if err != nil {
-		return 0, fmt.Errorf("auth check failed: %w", err)
-	}
-
-	utils.Logger.Debug("✅ Authentication working - account accessible")
-	return 30.0, nil // Placeholder - you have $30 in your wallet
+	// TODO: Implement live balance checking via Polymarket API
+	// For now, return user's reported balance
+	// Bot will fail gracefully if insufficient funds
+	return 21.0, nil
 }
 
 // GetActiveMarkets retrieves all active markets

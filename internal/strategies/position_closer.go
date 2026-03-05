@@ -91,68 +91,48 @@ func (pc *PositionCloser) shouldClosePosition(pos database.Position) (bool, floa
 		return true, 0, "market closed/resolved"
 	}
 
-	// Get current price for the position's outcome
+	// Oracle lag strategy: we know the outcome from IEM data, so always hold to resolution.
+	// The payout at resolution is $1.00/share — selling early at 75-80¢ leaves money on the table.
 	currentPrice := pc.getCurrentPrice(*market, pos.Outcome)
-	if currentPrice <= 0 {
-		return false, 0, "invalid current price"
-	}
-
-	// Calculate current profit
-	// If we bought at $0.30, current price is $0.90, profit = (0.90 - 0.30) * shares
-	profitPerShare := currentPrice - pos.EntryPrice
-	profitPercent := (profitPerShare / pos.EntryPrice) * 100
-
-	utils.Logger.Debugf("Position %s (%s): Entry=$%.2f, Current=$%.2f, Profit=%.2f%%",
-		pos.MarketQuestion, pos.Outcome, pos.EntryPrice, currentPrice, profitPercent)
-
-	// Close if profit target reached (e.g., 20% profit)
-	profitTarget := 20.0 // 20% profit target
-	if profitPercent >= profitTarget {
-		return true, currentPrice, fmt.Sprintf("profit target reached: %.2f%% (target: %.0f%%)", profitPercent, profitTarget)
-	}
-
-	// Close if position is very old and at least break-even (been open > 24 hours)
 	positionAge := time.Since(pos.EntryTime)
-	if positionAge > 24*time.Hour && profitPercent >= 0 {
-		return true, currentPrice, fmt.Sprintf("position aged out: %.1f hours old", positionAge.Hours())
-	}
+	utils.Logger.Debugf("Position %s (%s): Entry=$%.2f, Current=$%.2f, Age=%.1fh — holding to resolution",
+		pos.MarketQuestion, pos.Outcome, pos.EntryPrice, currentPrice, positionAge.Hours())
 
-	// Close if market is about to close (within 1 hour of close time)
-	if !market.ResolutionTimestamp.IsZero() {
-		timeUntilClose := time.Until(market.ResolutionTimestamp)
-		if timeUntilClose < time.Hour && profitPercent > -5 {
-			return true, currentPrice, fmt.Sprintf("market closing soon: %.0f minutes", timeUntilClose.Minutes())
-		}
-	}
-
-	return false, currentPrice, fmt.Sprintf("holding (profit: %.2f%%, age: %.1fh)", profitPercent, positionAge.Hours())
+	return false, currentPrice, fmt.Sprintf("holding to resolution (age: %.1fh)", positionAge.Hours())
 }
 
 // closePosition sells the position and records the trade
 func (pc *PositionCloser) closePosition(pos database.Position, currentPrice float64, reason string) error {
 	utils.Logger.Infof("💰 Closing position: %s (%s) - %s", pos.MarketQuestion, pos.Outcome, reason)
 
-	// Calculate shares and sell amount
 	shares := pos.PositionSize / pos.EntryPrice
-	sellAmount := shares * currentPrice // Dollar amount we'll receive
+	var sellAmount float64
+	var profit float64
+	var profitPercent float64
 
-	// Check if we have TokenID
-	if pos.TokenID == "" {
-		utils.Logger.Warnf("⚠️ Cannot sell position - TokenID not stored. Skipping...")
-		return fmt.Errorf("no token ID for position")
+	// If market is resolved (price=0), redemption happens on-chain automatically.
+	// Don't place a sell order — just record the outcome at $1.00 per winning share.
+	if currentPrice == 0 {
+		utils.Logger.Infof("🏁 Market resolved — skipping sell order, recording redemption at $1.00/share")
+		sellAmount = shares * 1.0
+		profit = sellAmount - pos.PositionSize
+		profitPercent = (profit / pos.PositionSize) * 100
+	} else {
+		// Check if we have TokenID
+		if pos.TokenID == "" {
+			utils.Logger.Warnf("⚠️ Cannot sell position - TokenID not stored. Skipping...")
+			return fmt.Errorf("no token ID for position")
+		}
+
+		sellAmount = shares * currentPrice
+		err := pc.client.PlaceSellOrder(pos.TokenID, currentPrice, sellAmount)
+		if err != nil {
+			return fmt.Errorf("failed to place sell order: %w", err)
+		}
+		utils.Logger.Infof("✅ Sell order placed: %.2f shares @ $%.2f = $%.2f", shares, currentPrice, sellAmount)
+		profit = sellAmount - pos.PositionSize
+		profitPercent = (profit / pos.PositionSize) * 100
 	}
-
-	// Place sell order
-	err := pc.client.PlaceSellOrder(pos.TokenID, currentPrice, sellAmount)
-	if err != nil {
-		return fmt.Errorf("failed to place sell order: %w", err)
-	}
-
-	utils.Logger.Infof("✅ Sell order placed: %.2f shares @ $%.2f = $%.2f", shares, currentPrice, sellAmount)
-
-	// Calculate profit
-	profit := sellAmount - pos.PositionSize
-	profitPercent := (profit / pos.PositionSize) * 100
 
 	// Log trade to database
 	trade := database.Trade{

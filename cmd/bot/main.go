@@ -76,11 +76,6 @@ func main() {
 	logger.Info("Weather Oracle Lag strategy initialized")
 	fmt.Println("✅ Weather Oracle Lag strategy ready")
 
-	// Initialize Position Closer
-	fmt.Println("Initializing Position Closer...")
-	positionCloser := strategies.NewPositionCloser(client, db, cfg)
-	logger.Info("Position Closer initialized")
-	fmt.Println("✅ Position Closer ready")
 
 	fmt.Println()
 	fmt.Println("============================")
@@ -123,15 +118,21 @@ func main() {
 		cancel()
 	}()
 
-	// Start position closer (checks every 5 minutes)
+
+	// Auto-claim resolved positions every 5 minutes
 	go func() {
 		ticker := time.NewTicker(5 * time.Minute)
 		defer ticker.Stop()
-
 		for {
 			select {
 			case <-ticker.C:
-				positionCloser.CheckAndClosePositions(ctx)
+				result, err := oracleLagStrategy.CheckAndClaimPositions(ctx)
+				if err != nil {
+					logger.Errorf("Failed to check/claim positions: %v", err)
+				} else if result != nil && (result.Wins+result.Losses) > 0 {
+					logger.Infof("🏁 Claimed positions — Wins: %d, Losses: %d, Profit: $%.2f",
+						result.Wins, result.Losses, result.TotalProfit)
+				}
 			case <-ctx.Done():
 				return
 			}

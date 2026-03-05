@@ -328,74 +328,22 @@ func (s *OracleLagStrategy) ScanOpportunities(ctx context.Context) <-chan Opport
 				continue
 			}
 
-			// Calculate edge for both sides
-			// Confidence represents true probability of YES outcome
-			// Edge for YES = true_prob_yes - price_yes
-			// Edge for NO = true_prob_no - price_no = (1 - true_prob_yes) - (1 - price_yes)
-			trueProbYes := confidence
-			trueProbNo := 1.0 - confidence
-
-			edgeYes := trueProbYes - yesPrice
-			edgeNo := trueProbNo - noPrice
+			// Always bet what the resolver determined (YES or NO)
+			// Edge is calculated purely to confirm the market hasn't already priced in the outcome
+			bestOutcome := *outcome
+			var bestPrice, bestEdge float64
+			if bestOutcome == "Yes" {
+				bestPrice = yesPrice
+				bestEdge = confidence - yesPrice
+			} else {
+				bestPrice = noPrice
+				bestEdge = (1.0 - confidence) - noPrice
+			}
 
 			// Log edge analysis
 			utils.Logger.Debugf("📊 Edge Analysis: %s", market.Question)
-			utils.Logger.Debugf("  Confidence (true prob YES): %.1f%%", trueProbYes*100)
-			utils.Logger.Debugf("  YES: price=$%.3f, edge=%.1f%% | NO: price=$%.3f, edge=%.1f%%",
-				yesPrice, edgeYes*100, noPrice, edgeNo*100)
-
-			// Determine which side has better edge
-			bestOutcome := *outcome
-			bestPrice := yesPrice
-			bestEdge := edgeYes
-			consideringNo := false
-
-			if edgeNo > edgeYes {
-				// NO side has better edge
-				if *outcome == "Yes" {
-					bestOutcome = "No"
-				} else {
-					bestOutcome = "Yes"
-				}
-				bestPrice = noPrice
-				bestEdge = edgeNo
-				consideringNo = true
-				utils.Logger.Debugf("  ✓ Selected NO side (edge: %.1f%% > %.1f%%)", edgeNo*100, edgeYes*100)
-			} else {
-				utils.Logger.Debugf("  ✓ Selected YES side (edge: %.1f%% > %.1f%%)", edgeYes*100, edgeNo*100)
-			}
-
-			// ADJACENT BUCKET EXCLUSION: Skip NO bets on temperature buckets in uncertain zone
-			// This prevents betting NO on buckets adjacent to the actual temperature
-			if consideringNo {
-				bucket := parseBucketFromQuestion(market.Question)
-				if bucket != nil && bucket.IsRange {
-					// For temperature range buckets, use confidence to detect adjacency risk
-					//
-					// Confidence interpretation:
-					// - High confidence (>90%) in YES → actual temp IS in this bucket → don't bet NO!
-					// - Low confidence (<10%) in NO → actual temp is FAR from this bucket → safe to bet NO
-					// - Medium confidence (10-90%) → actual temp MIGHT BE NEAR this bucket → SKIP NO bet
-					//
-					// The "uncertain zone" (15-85%) catches buckets adjacent to actual temp
-					// Example: If actual temp is 51°F:
-					//   - "50-51°F" bucket: ~95% confidence YES (in the bucket)
-					//   - "52-53°F" bucket: ~20% confidence YES (adjacent - SKIP NO)
-					//   - "48-49°F" bucket: ~20% confidence YES (adjacent - SKIP NO)
-					//   - "54-55°F" bucket: ~5% confidence YES (far away - OK to bet NO)
-
-					if confidence >= 0.15 && confidence <= 0.85 {
-						utils.Logger.Infof("  ⚠️  SKIPPING NO bet - bucket in uncertain zone (adjacent risk)")
-						utils.Logger.Debugf("    Market: %s", market.Question)
-						utils.Logger.Debugf("    Confidence %.1f%% suggests actual temp near %.0f-%.0f range",
-							confidence*100, bucket.LowTemp, bucket.HighTemp)
-						utils.Logger.Debugf("    Buying NO on adjacent buckets wastes money when temp is between them")
-						continue
-					}
-
-					utils.Logger.Debugf("  ✓ NO bet approved - bucket far from actual temp (confidence: %.1f%%)", confidence*100)
-				}
-			}
+			utils.Logger.Debugf("  Resolver outcome: %s | Confidence: %.1f%% | Price: $%.3f | Edge: %.1f%%",
+				bestOutcome, confidence*100, bestPrice, bestEdge*100)
 
 			// Use dynamic profit threshold (convert to edge threshold)
 			dynamicThreshold := s.getDynamicThreshold()
@@ -405,10 +353,8 @@ func (s *OracleLagStrategy) ScanOpportunities(ctx context.Context) <-chan Opport
 				continue
 			}
 
-			// Calculate expected profit based on edge
-			// Expected value = edge * position_size (before fees)
-			// After fees: EV = (edge - fee) * position_size
-			expectedProfit := bestEdge - (bestPrice * PolymarketFee)
+			// Calculate expected profit: edge minus flat Polymarket fee
+			expectedProfit := bestEdge - PolymarketFee
 
 			// Find the token ID for the outcome
 			tokenID := s.getTokenIDForOutcome(market, bestOutcome)
@@ -812,8 +758,15 @@ func (s *OracleLagStrategy) CheckAndClaimPositions(ctx context.Context) (*Redemp
 			continue
 		}
 
-		// Market is closed - determine win or loss
-		if market.ResolvedOutcome != nil && strings.EqualFold(*market.ResolvedOutcome, pos.Outcome) {
+		// Market is closed — wait until ResolvedOutcome is populated before acting
+		if market.ResolvedOutcome == nil {
+			utils.Logger.Debugf("Market closed but outcome not yet set for position #%d: %s — waiting", pos.ID, pos.MarketQuestion)
+			result.Pending++
+			continue
+		}
+
+		// Determine win or loss
+		if strings.EqualFold(*market.ResolvedOutcome, pos.Outcome) {
 			// WIN - our outcome was correct
 			if err := database.ClaimPosition(s.db, pos.ID, 1.0); err != nil {
 				utils.Logger.Errorf("Failed to claim position #%d: %v", pos.ID, err)
@@ -829,13 +782,21 @@ func (s *OracleLagStrategy) CheckAndClaimPositions(ctx context.Context) (*Redemp
 
 			// Send Discord notification
 			if s.config.DiscordWebhookURL != "" {
-				msg := fmt.Sprintf("🏆 **Position Won!**\n"+
-					"Market: %s\n"+
-					"Outcome: %s\n"+
-					"Entry: $%.2f | Exit: $1.00\n"+
-					"Profit: $%.2f (%.1f%%)",
-					pos.MarketQuestion, pos.Outcome,
-					pos.EntryPrice, profit, (profit/pos.PositionSize)*100)
+				profitPct := (profit / pos.PositionSize) * 100
+				holdDuration := time.Since(pos.EntryTime).Round(time.Minute)
+				msg := fmt.Sprintf(
+					"🏆 **Position Won!**\n"+
+						"📋 **Market:** %s\n"+
+						"✅ **Outcome:** %s\n"+
+						"💵 **Staked:** $%.2f @ $%.2f entry\n"+
+						"💰 **Profit:** +$%.2f (+%.1f%%)\n"+
+						"⏱️ **Held for:** %s",
+					pos.MarketQuestion,
+					pos.Outcome,
+					pos.PositionSize, pos.EntryPrice,
+					profit, profitPct,
+					holdDuration.String(),
+				)
 				if err := utils.SendDiscordNotification(s.config.DiscordWebhookURL, msg); err != nil {
 					utils.Logger.Errorf("Failed to send win notification: %v", err)
 				}
@@ -855,11 +816,20 @@ func (s *OracleLagStrategy) CheckAndClaimPositions(ctx context.Context) (*Redemp
 
 			// Send Discord notification
 			if s.config.DiscordWebhookURL != "" {
-				msg := fmt.Sprintf("❌ **Position Lost**\n"+
-					"Market: %s\n"+
-					"Outcome: %s\n"+
-					"Loss: -$%.2f",
-					pos.MarketQuestion, pos.Outcome, pos.PositionSize)
+				holdDuration := time.Since(pos.EntryTime).Round(time.Minute)
+				msg := fmt.Sprintf(
+					"❌ **Position Lost**\n"+
+						"📋 **Market:** %s\n"+
+						"🚫 **Outcome:** %s\n"+
+						"💵 **Staked:** $%.2f @ $%.2f entry\n"+
+						"📉 **Loss:** -$%.2f\n"+
+						"⏱️ **Held for:** %s",
+					pos.MarketQuestion,
+					pos.Outcome,
+					pos.PositionSize, pos.EntryPrice,
+					pos.PositionSize,
+					holdDuration.String(),
+				)
 				if err := utils.SendDiscordNotification(s.config.DiscordWebhookURL, msg); err != nil {
 					utils.Logger.Errorf("Failed to send loss notification: %v", err)
 				}

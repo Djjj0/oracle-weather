@@ -1,0 +1,286 @@
+package main
+
+import (
+	"context"
+	"fmt"
+	"os"
+	"os/signal"
+	"sync"
+	"syscall"
+	"time"
+
+	"github.com/djbro/polymarket-oracle-bot/internal/config"
+	"github.com/djbro/polymarket-oracle-bot/internal/core"
+	"github.com/djbro/polymarket-oracle-bot/internal/database"
+	"github.com/djbro/polymarket-oracle-bot/internal/resolvers"
+	"github.com/djbro/polymarket-oracle-bot/internal/strategies"
+	"github.com/djbro/polymarket-oracle-bot/internal/strategies/parity_arbitrage"
+	"github.com/djbro/polymarket-oracle-bot/pkg/polymarket"
+	"github.com/djbro/polymarket-oracle-bot/pkg/utils"
+	"github.com/sirupsen/logrus"
+)
+
+func main() {
+	fmt.Println("🤖 Polymarket Oracle Lag Bot")
+	fmt.Println("============================")
+	fmt.Println()
+
+	// Load configuration
+	fmt.Println("Loading configuration...")
+	cfg, err := config.LoadConfig()
+	if err != nil {
+		fmt.Printf("❌ Failed to load config: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Println("✅ Configuration loaded")
+
+	// Setup logger
+	fmt.Println("Setting up logger...")
+	logger := utils.SetupLogger(cfg.LogLevel)
+	logger.Info("Logger initialized")
+	fmt.Println("✅ Logger ready")
+
+	// Initialize database
+	fmt.Println("Initializing database...")
+	db, err := database.InitDB(cfg.DatabasePath)
+	if err != nil {
+		logger.Fatalf("Failed to initialize database: %v", err)
+	}
+	defer db.Close()
+	logger.Info("Database initialized")
+	fmt.Println("✅ Database ready")
+
+	// Initialize Polymarket client
+	fmt.Println("Connecting to Polymarket...")
+	client := polymarket.NewClient(cfg)
+	logger.Info("Polymarket client initialized")
+	fmt.Println("✅ Connected to Polymarket")
+
+	// Check on-chain balances and allowances
+	fmt.Println("Checking wallet balances...")
+	client.CheckBalanceAndAllowance()
+
+	// Ensure USDC spending is approved for Polymarket contracts
+	fmt.Println("Ensuring USDC allowances...")
+	if err := client.EnsureAllowance(); err != nil {
+		logger.Warnf("Allowance check issue (may already be set): %v", err)
+	} else {
+		fmt.Println("✅ USDC allowances verified")
+	}
+
+	// Initialize monitor and resolvers
+	fmt.Println("Setting up market monitor...")
+	monitor := core.NewMonitor(client, cfg)
+	factory := resolvers.NewFactory(cfg)
+	logger.Info("Monitor and resolvers initialized")
+	fmt.Println("✅ Monitor ready")
+
+	// Initialize Oracle Lag strategy
+	fmt.Println("Initializing Oracle Lag strategy...")
+	oracleLagStrategy := strategies.NewStrategy(monitor, factory, client, db, cfg)
+	logger.Info("Oracle Lag strategy initialized")
+	fmt.Println("✅ Oracle Lag strategy ready")
+
+	// Initialize Position Closer
+	fmt.Println("Initializing Position Closer...")
+	positionCloser := strategies.NewPositionCloser(client, db, cfg)
+	logger.Info("Position Closer initialized")
+	fmt.Println("✅ Position Closer ready")
+
+	// Initialize Parity Arbitrage strategy
+	fmt.Println("Initializing Parity Arbitrage strategy...")
+	circuitBreaker := core.NewCircuitBreaker(cfg.DailyLossLimit, cfg.DailyTradeLimit)
+	parityStrategy := parity_arbitrage.NewParityArbitrageStrategy(client, db, cfg, circuitBreaker)
+	logger.Info("Parity Arbitrage strategy initialized")
+	fmt.Println("✅ Parity Arbitrage strategy ready")
+
+	fmt.Println()
+	fmt.Println("============================")
+	fmt.Printf("Bot Configuration:\n")
+	fmt.Printf("Oracle Lag:\n")
+	fmt.Printf("  Min Profit Threshold: %.2f%%\n", cfg.MinProfitThreshold*100)
+	fmt.Printf("  Max Position Size: $%.2f\n", cfg.MaxPositionSize)
+	fmt.Printf("  Check Interval: %ds\n", cfg.CheckInterval)
+	fmt.Printf("\nParity Arbitrage:\n")
+	fmt.Printf("  Enabled: %v\n", cfg.ParityEnabled)
+	fmt.Printf("  Min Profit Threshold: %.2f%%\n", cfg.ParityMinProfitThreshold*100)
+	fmt.Printf("  Max Position Size: $%.2f\n", cfg.ParityMaxPositionSize)
+	fmt.Printf("  Scan Interval: %ds\n", cfg.ParityScanIntervalSeconds)
+	fmt.Printf("\nGeneral:\n")
+	fmt.Printf("  Log Level: %s\n", cfg.LogLevel)
+	fmt.Printf("  Circuit Breaker: $%.0f loss / %d trades\n", cfg.DailyLossLimit, cfg.DailyTradeLimit)
+	fmt.Println("============================")
+	fmt.Println()
+
+	// Setup graceful shutdown
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
+
+	go func() {
+		<-sigChan
+		logger.Info("Shutdown signal received, stopping bot...")
+		fmt.Println("\n🛑 Shutting down gracefully...")
+		cancel()
+	}()
+
+	// Start both strategies concurrently
+	logger.Info("Starting strategies...")
+	fmt.Println("🚀 Bot is running! Press Ctrl+C to stop.")
+	fmt.Println()
+
+	var wg sync.WaitGroup
+
+	// Run Oracle Lag strategy
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		runOracleLagStrategy(ctx, oracleLagStrategy, logger, cfg)
+	}()
+
+	// Run position redemption checker
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		runPositionRedemption(ctx, oracleLagStrategy, logger)
+	}()
+
+	// Run position closer
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		runPositionCloser(ctx, positionCloser, logger)
+	}()
+
+	// Run Parity Arbitrage strategy (if enabled)
+	if cfg.ParityEnabled {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := parityStrategy.Run(ctx); err != nil && err != context.Canceled {
+				logger.Errorf("Parity strategy error: %v", err)
+			}
+		}()
+	} else {
+		logger.Info("Parity Arbitrage strategy is disabled")
+	}
+
+	// Wait for shutdown signal
+	<-ctx.Done()
+	logger.Info("Waiting for strategies to stop...")
+	wg.Wait()
+
+	logger.Info("Bot stopped")
+	fmt.Println("✅ Bot stopped successfully")
+}
+
+// runOracleLagStrategy runs the oracle lag strategy loop
+func runOracleLagStrategy(ctx context.Context, strategy *strategies.OracleLagStrategy, logger *logrus.Logger, cfg *config.Config) {
+	ticker := time.NewTicker(time.Duration(cfg.CheckInterval) * time.Second)
+	defer ticker.Stop()
+
+	// Run first scan immediately
+	runScan(ctx, strategy, logger)
+
+	// Then run on ticker
+	for {
+		select {
+		case <-ticker.C:
+			runScan(ctx, strategy, logger)
+		case <-ctx.Done():
+			return
+		}
+	}
+}
+
+// runPositionRedemption periodically checks open positions for resolution
+func runPositionRedemption(ctx context.Context, strategy *strategies.OracleLagStrategy, logger *logrus.Logger) {
+	ticker := time.NewTicker(120 * time.Second)
+	defer ticker.Stop()
+
+	// Run first check after a short delay (let the first scan complete first)
+	time.Sleep(30 * time.Second)
+	checkPositions(ctx, strategy, logger)
+
+	for {
+		select {
+		case <-ticker.C:
+			checkPositions(ctx, strategy, logger)
+		case <-ctx.Done():
+			return
+		}
+	}
+}
+
+func checkPositions(ctx context.Context, strategy *strategies.OracleLagStrategy, logger *logrus.Logger) {
+	result, err := strategy.CheckAndClaimPositions(ctx)
+	if err != nil {
+		logger.Errorf("Position redemption error: %v", err)
+		return
+	}
+
+	if result.Wins > 0 || result.Losses > 0 {
+		logger.Infof("📊 Redemption: %d won, %d lost, P&L: $%.2f, %d still pending",
+			result.Wins, result.Losses, result.TotalProfit, result.Pending)
+	} else if result.Pending > 0 {
+		logger.Debugf("📊 %d open positions awaiting resolution", result.Pending)
+	}
+}
+
+// runPositionCloser periodically checks open positions for profit-taking opportunities
+func runPositionCloser(ctx context.Context, closer *strategies.PositionCloser, logger *logrus.Logger) {
+	// Check positions every 5 minutes
+	ticker := time.NewTicker(5 * time.Minute)
+	defer ticker.Stop()
+
+	// Run first check after 1 minute (let initial scans complete)
+	time.Sleep(1 * time.Minute)
+	if err := closer.CheckAndClosePositions(ctx); err != nil {
+		logger.Errorf("Position closer error: %v", err)
+	}
+
+	for {
+		select {
+		case <-ticker.C:
+			if err := closer.CheckAndClosePositions(ctx); err != nil {
+				logger.Errorf("Position closer error: %v", err)
+			}
+		case <-ctx.Done():
+			return
+		}
+	}
+}
+
+func runScan(ctx context.Context, strategy *strategies.OracleLagStrategy, logger *logrus.Logger) {
+	logger.Info("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+	logger.Infof("Starting scan at %s", time.Now().Format("2006-01-02 15:04:05"))
+
+	// Scan for opportunities
+	opportunities := strategy.ScanOpportunities(ctx)
+
+	opportunityCount := 0
+	for opp := range opportunities {
+		opportunityCount++
+
+		logger.Infof("🎯 Opportunity #%d:", opportunityCount)
+		logger.Infof("   Market: %s", opp.MarketQuestion)
+		logger.Infof("   Outcome: %s", opp.Outcome)
+		logger.Infof("   Current Price: $%.2f", opp.CurrentPrice)
+		logger.Infof("   Expected Profit: %.2f%%", opp.ExpectedProfit*100)
+		logger.Infof("   Confidence: %.2f%%", opp.Confidence*100)
+		logger.Infof("   Oracle Lag: %s", opp.Lag.String())
+
+		// Execute the opportunity
+		if err := strategy.ExecuteOpportunity(ctx, opp); err != nil {
+			logger.Errorf("Failed to execute opportunity: %v", err)
+		}
+	}
+
+	if opportunityCount == 0 {
+		logger.Info("No opportunities found in this scan")
+	} else {
+		logger.Infof("✅ Scan complete - found %d opportunities", opportunityCount)
+	}
+}

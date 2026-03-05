@@ -29,6 +29,7 @@ type Market struct {
 	CreatedAt           time.Time `json:"createdAt"`         // Gamma uses camelCase
 	UpdatedAt           time.Time `json:"updatedAt"`         // Gamma uses camelCase
 	FetchedAt           time.Time `json:"-"`                 // Track when we fetched this data
+	ResolverLink        string    `json:"resolverLink"`      // UMA resolver link (e.g., WU link)
 }
 
 // IsStale checks if market data is stale (older than 60 seconds)

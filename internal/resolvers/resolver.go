@@ -35,12 +35,6 @@ type MarketData struct {
 	Extra       map[string]interface{} // Additional parsed data
 }
 
-// CachedResult stores outcome and confidence for caching
-type CachedResult struct {
-	Outcome    string
-	Confidence float64
-}
-
 // BaseResolver provides common functionality for all resolvers
 type BaseResolver struct {
 	confidence float64
