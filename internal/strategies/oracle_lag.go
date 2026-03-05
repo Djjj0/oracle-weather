@@ -758,15 +758,13 @@ func (s *OracleLagStrategy) CheckAndClaimPositions(ctx context.Context) (*Redemp
 			continue
 		}
 
-		// Market is closed — wait until ResolvedOutcome is populated before acting
-		if market.ResolvedOutcome == nil {
-			utils.Logger.Debugf("Market closed but outcome not yet set for position #%d: %s — waiting", pos.ID, pos.MarketQuestion)
-			result.Pending++
-			continue
-		}
+		// Determine win or loss from outcomePrices — winner has price 1.0, loser 0.0.
+		// The Gamma API does not populate resolved_outcome; use prices instead.
+		won := s.outcomeWon(market.Outcomes, market.Prices, pos.Outcome)
+		utils.Logger.Infof("Market closed: %s | Outcomes: %v | Prices: %v | We held: %s | Won: %v",
+			pos.MarketQuestion, market.Outcomes, market.Prices, pos.Outcome, won)
 
-		// Determine win or loss
-		if strings.EqualFold(*market.ResolvedOutcome, pos.Outcome) {
+		if won {
 			// WIN - our outcome was correct
 			if err := database.ClaimPosition(s.db, pos.ID, 1.0); err != nil {
 				utils.Logger.Errorf("Failed to claim position #%d: %v", pos.ID, err)
@@ -861,4 +859,15 @@ func (s *OracleLagStrategy) getTokenIDForOutcome(market polymarket.Market, outco
 	}
 
 	return ""
+}
+
+// outcomeWon checks if the held outcome won by finding its price in outcomePrices.
+// Polymarket sets the winning outcome price to 1.0 and losing to 0.0 after resolution.
+func (s *OracleLagStrategy) outcomeWon(outcomes []string, prices []float64, heldOutcome string) bool {
+	for i, o := range outcomes {
+		if strings.EqualFold(o, heldOutcome) && i < len(prices) {
+			return prices[i] >= 0.99
+		}
+	}
+	return false
 }
