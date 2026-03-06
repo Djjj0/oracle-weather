@@ -60,24 +60,26 @@ func (w *MultiSourceWeatherResolver) CheckResolution(market polymarket.Market) (
 		loc = time.UTC
 	}
 
-	var peakHour int
+	// Minimum local hour before we allow trading — temperatures must have had
+	// time to peak. Rain needs full day. Temperature markets need post-peak data.
+	var minHour int
 	switch data.Condition {
 	case "rain", "precipitation":
-		peakHour = 23
+		minHour = 23
 	default:
-		peakHour = 13
+		minHour = cityMinTradingHour(data.Location)
 	}
 
 	localDate := data.Date.In(loc)
-	peakTimeLocal := time.Date(localDate.Year(), localDate.Month(), localDate.Day(), peakHour, 0, 0, 0, loc)
+	gateTime := time.Date(localDate.Year(), localDate.Month(), localDate.Day(), minHour, 0, 0, 0, loc)
 
 	now := time.Now().In(loc)
-	if now.Before(peakTimeLocal) {
-		utils.Logger.Debugf("⏳ Multi-source market not ready: %s on %s | Now: %s | Peak: %s (%.1fh remaining)",
-			data.Location, data.Date.Format("2006-01-02"),
+	if now.Before(gateTime) {
+		utils.Logger.Infof("⏳ Too early to trade %s: now %s local, gate is %s (%.1fh remaining)",
+			data.Location,
 			now.Format("15:04 MST"),
-			peakTimeLocal.Format("15:04 MST"),
-			peakTimeLocal.Sub(now).Hours())
+			gateTime.Format("15:04 MST"),
+			gateTime.Sub(now).Hours())
 		return nil, 0, nil
 	}
 
@@ -210,6 +212,70 @@ func (w *MultiSourceWeatherResolver) determineOutcome(data *MarketData, temp flo
 	default:
 		return "No", 0.50
 	}
+}
+
+// cityMinTradingHour returns the earliest local hour at which we allow trading
+// a temperature market for a given city. This is set conservatively — 1-2 hours
+// after the typical daily high is reached — to avoid acting on incomplete data.
+func cityMinTradingHour(city string) int {
+	hours := map[string]int{
+		// US cities — IEM data finalises by early evening; peaks ~1-4pm local
+		"chicago":       19, // 7pm CST (from DEPLOYMENT_READY)
+		"seattle":       17, // 5pm PST
+		"new york":      20, // 8pm EST
+		"miami":         20, // 8pm EST
+		"dallas":        19, // 7pm CST
+		"atlanta":       20, // 8pm EST
+		"los angeles":   18, // 6pm PST
+		"houston":       19, // 7pm CST
+		"phoenix":       19, // 7pm MST
+		"denver":        19, // 7pm MST
+		"boston":        20, // 8pm EST
+		"washington":    20, // 8pm EST
+		"las vegas":     18, // 6pm PST
+		"portland":      17, // 5pm PST
+		"minneapolis":   19, // 7pm CST
+		"san francisco": 18, // 6pm PST
+
+		// Europe — peaks 2-4pm local; trade from 6pm to be safe
+		"london":    18, // 6pm GMT/BST
+		"paris":     18, // 6pm CET/CEST
+		"berlin":    18, // 6pm CET/CEST
+		"madrid":    19, // 7pm CET/CEST (later peak due to latitude/climate)
+		"rome":      18, // 6pm CET/CEST
+		"amsterdam": 18,
+		"brussels":  18,
+		"vienna":    18,
+		"prague":    18,
+		"stockholm": 18,
+		"oslo":      18,
+		"helsinki":  18,
+		"copenhagen": 18,
+		"lisbon":    18,
+		"athens":    19,
+		"warsaw":    18,
+		"budapest":  18,
+		"zurich":    18,
+		"milan":     18,
+		"munich":    18,
+		"moscow":    18,
+		"barcelona": 19,
+
+		// Other international
+		"toronto":      20, // 8pm EST
+		"buenos aires": 19, // 7pm ART
+		"seoul":        18, // 6pm KST
+		"tokyo":        18, // 6pm JST
+		"sydney":       18,
+		"singapore":    18,
+		"hong kong":    18,
+		"dubai":        19,
+		"mumbai":       18,
+	}
+	if h, ok := hours[strings.ToLower(city)]; ok {
+		return h
+	}
+	return 19 // safe default: 7pm local
 }
 
 // ParseMarketQuestion delegates to the base weather resolver's parsing logic

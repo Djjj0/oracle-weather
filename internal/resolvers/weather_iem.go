@@ -205,6 +205,15 @@ func (w *IEMWeatherResolver) CheckResolution(market polymarket.Market) (*string,
 	utils.Logger.Debugf("IEM running high: %s (%s) on %s = %.1f%s at %.1f local hour",
 		data.Location, airportCode, data.Date.Format("2006-01-02"), runningHigh, unitSymbol, currentHour)
 
+	// Enforce hard minimum trading hour regardless of learning DB data.
+	// This prevents early NO bets on days when the temperature hasn't peaked yet.
+	hardFloor := float64(cityMinTradingHour(data.Location))
+	if currentHour < hardFloor {
+		utils.Logger.Infof("⏳ Too early to trade %s: %.1f local hour < %.0f gate",
+			data.Location, currentHour, hardFloor)
+		return nil, 0, nil
+	}
+
 	// Determine typical peak hour for this city from learning DB
 	// Falls back to 15.0 (3 PM) if not yet in DB
 	typicalPeakHour := w.getTypicalPeakHour(data.Location, loc)
