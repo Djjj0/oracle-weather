@@ -161,6 +161,9 @@ func (s *SportsResolver) ParseMarketQuestion(question string) (*MarketData, erro
 }
 
 // CheckResolution checks sports game result and returns outcome with confidence
+// Name returns the human-readable name for this resolver.
+func (s *SportsResolver) Name() string { return "ESPN US Sports" }
+
 func (s *SportsResolver) CheckResolution(market polymarket.Market) (*string, float64, error) {
 	// Parse the question
 	data, err := s.ParseMarketQuestion(market.Question)

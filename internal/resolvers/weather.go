@@ -125,6 +125,9 @@ func NewWeatherResolver(cfg *config.Config) *WeatherResolver {
 	return resolver
 }
 
+// Name returns the human-readable name for this resolver.
+func (w *WeatherResolver) Name() string { return "OpenWeatherMap Weather" }
+
 // ParseMarketQuestion extracts weather data from a market question
 func (w *WeatherResolver) ParseMarketQuestion(question string) (*MarketData, error) {
 	questionLower := strings.ToLower(question)

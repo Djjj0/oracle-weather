@@ -193,6 +193,9 @@ func (c *CryptoResolver) ParseMarketQuestion(question string) (*MarketData, erro
 }
 
 // CheckResolution checks crypto price and returns outcome with confidence
+// Name returns the human-readable name for this resolver.
+func (c *CryptoResolver) Name() string { return "CoinGecko Crypto" }
+
 func (c *CryptoResolver) CheckResolution(market polymarket.Market) (*string, float64, error) {
 	// Parse the question
 	data, err := c.ParseMarketQuestion(market.Question)

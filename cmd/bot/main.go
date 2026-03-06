@@ -152,7 +152,7 @@ func main() {
 				logger.Info("Scanning for weather oracle lag opportunities...")
 
 				// Scan for opportunities
-				opportunities, _ := oracleLagStrategy.ScanOpportunities(ctx)
+				opportunities, scanResultChan := oracleLagStrategy.ScanOpportunities(ctx)
 
 				// Execute each opportunity
 				opportunityCount := 0
@@ -161,6 +161,12 @@ func main() {
 					if err := oracleLagStrategy.ExecuteOpportunity(ctx, opp); err != nil {
 						logger.Errorf("Failed to execute opportunity: %v", err)
 					}
+				}
+
+				// Drain and log the scan result summary
+				if scanResult, ok := <-scanResultChan; ok {
+					logger.Infof("Scan summary: scanned=%d found=%d skipped=%d executed=%d",
+						scanResult.MarketsScanned, scanResult.Opportunities, scanResult.Skipped, opportunityCount)
 				}
 
 				if opportunityCount == 0 {

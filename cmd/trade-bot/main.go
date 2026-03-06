@@ -114,7 +114,7 @@ func runOracleLagStrategy(ctx context.Context, strategy *strategies.OracleLagStr
 	defer ticker.Stop()
 
 	// Run immediately on start
-	scanAndExecute(ctx, strategy, logger)
+	scanAndExecute(ctx, strategy, logger, cfg)
 
 	for {
 		select {
@@ -122,7 +122,7 @@ func runOracleLagStrategy(ctx context.Context, strategy *strategies.OracleLagStr
 			logger.Info("Oracle Lag strategy stopped")
 			return
 		case <-ticker.C:
-			scanAndExecute(ctx, strategy, logger)
+			scanAndExecute(ctx, strategy, logger, cfg)
 		}
 	}
 }
@@ -219,25 +219,48 @@ func runDailyReport(ctx context.Context, db *bolt.DB, cfg *config.Config, logger
 	}
 }
 
-func scanAndExecute(ctx context.Context, strategy *strategies.OracleLagStrategy, logger *logrus.Logger) {
+func scanAndExecute(ctx context.Context, strategy *strategies.OracleLagStrategy, logger *logrus.Logger, cfg *config.Config) {
 	logger.Info("Starting scan for opportunities...")
 
-	opportunities, _ := strategy.ScanOpportunities(ctx)
+	opportunities, resultChan := strategy.ScanOpportunities(ctx)
 	count := 0
+	executed := 0
 
 	for opp := range opportunities {
 		count++
 		logger.Infof("Found opportunity #%d", count)
-
-		// Execute opportunity
 		if err := strategy.ExecuteOpportunity(ctx, opp); err != nil {
 			logger.Errorf("Failed to execute opportunity: %v", err)
+		} else {
+			executed++
+		}
+	}
+
+	scanResult := <-resultChan
+
+	// Log skip breakdown to console/file
+	logger.Infof("Scan summary: scanned=%d found=%d skipped=%d executed=%d",
+		scanResult.MarketsScanned, scanResult.Opportunities, scanResult.Skipped, executed)
+	if len(scanResult.SkipReasons) > 0 {
+		logger.Info("Skip reason breakdown:")
+		for reason, cnt := range scanResult.SkipReasons {
+			logger.Infof("  %-40s %d", reason, cnt)
 		}
 	}
 
 	if count == 0 {
 		logger.Info("No opportunities found this scan")
 	} else {
-		logger.Infof("Scan complete - found %d opportunities", count)
+		logger.Infof("Scan complete - found %d opportunities, executed %d", count, executed)
+	}
+
+	// Send Discord scan summary
+	if cfg.DiscordWebhookURL != "" {
+		noResolverCount := scanResult.SkipReasons["no_resolver"] + scanResult.SkipReasons["market_filter"]
+		withResolver := scanResult.MarketsScanned - noResolverCount
+		msg := utils.ScanSummaryMessage(scanResult.MarketsScanned, withResolver, scanResult.Opportunities, scanResult.Opportunities, scanResult.SkipReasons)
+		if err := utils.SendDiscordNotification(cfg.DiscordWebhookURL, msg); err != nil {
+			logger.Errorf("Failed to send scan summary to Discord: %v", err)
+		}
 	}
 }

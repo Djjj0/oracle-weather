@@ -20,6 +20,9 @@ type Resolver interface {
 
 	// GetConfidence returns the base confidence level (0.0 to 1.0) for this resolver type
 	GetConfidence() float64
+
+	// Name returns a human-readable name for this resolver (e.g. "IEM Weather", "CoinGecko Crypto")
+	Name() string
 }
 
 // MarketData represents parsed market question data
@@ -43,6 +46,11 @@ type BaseResolver struct {
 // GetConfidence returns the confidence level
 func (b *BaseResolver) GetConfidence() float64 {
 	return b.confidence
+}
+
+// Name returns a default resolver name; concrete resolvers should override this.
+func (b *BaseResolver) Name() string {
+	return "Unknown Resolver"
 }
 
 // SetConfidence sets the confidence level

@@ -47,14 +47,28 @@ func PlaceOrderViaPython(ctx context.Context, tokenID string, price, size float6
 		return nil, fmt.Errorf("failed to marshal order request: %w", err)
 	}
 
-	// Get Python script path (assuming scripts directory is in project root)
-	scriptPath := filepath.Join("scripts", "place_order.py")
+	// Get Python script path relative to the executable's directory
+	exePath, _ := filepath.Abs(filepath.Join("scripts", "place_order.py"))
+	scriptPath := exePath
 
-	// Create command with timeout
-	cmdCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	// Find Python interpreter - use full path to avoid Windows PATH issues
+	pythonExe := "python"
+	if path, err := exec.LookPath("python"); err == nil {
+		pythonExe = path
+	} else if path, err := exec.LookPath("python3"); err == nil {
+		pythonExe = path
+	}
+
+	// Create command with timeout.
+	// py_clob_client.create_or_derive_api_creds() makes multiple Polygon RPC calls
+	// and can take 20-30s on slow connections. Use 90s to avoid false timeouts.
+	cmdCtx, cancel := context.WithTimeout(ctx, 90*time.Second)
 	defer cancel()
 
-	cmd := exec.CommandContext(cmdCtx, "python", scriptPath, string(reqJSON))
+	cmd := exec.CommandContext(cmdCtx, pythonExe, scriptPath, string(reqJSON))
+
+	// Force unbuffered Python output so stdout is flushed before exit
+	cmd.Env = append(cmd.Environ(), "PYTHONUNBUFFERED=1")
 
 	// Capture stdout and stderr
 	var stdout, stderr bytes.Buffer
@@ -77,11 +91,14 @@ func PlaceOrderViaPython(ctx context.Context, tokenID string, price, size float6
 			return nil, fmt.Errorf("failed to parse Python response: %w (output: %s)", err, stdout.String())
 		}
 	} else {
-		// No stdout, check if there was an execution error
-		if err != nil {
-			return nil, fmt.Errorf("Python script execution failed: %w (stderr: %s)", err, stderr.String())
+		// No stdout - log stderr to help diagnose
+		if stderr.Len() > 0 {
+			utils.Logger.Errorf("Python script stderr: %s", stderr.String())
 		}
-		return nil, fmt.Errorf("Python script produced no output (stderr: %s)", stderr.String())
+		if err != nil {
+			return nil, fmt.Errorf("Python script execution failed: %w (python=%s, script=%s, stderr=%s)", err, pythonExe, scriptPath, stderr.String())
+		}
+		return nil, fmt.Errorf("Python script produced no output (python=%s, script=%s, stderr=%s)", pythonExe, scriptPath, stderr.String())
 	}
 
 	// Log result

@@ -134,6 +134,9 @@ func (s *SoccerResolver) ParseMarketQuestion(question string) (*MarketData, erro
 }
 
 // CheckResolution checks soccer match result and returns outcome with confidence
+// Name returns the human-readable name for this resolver.
+func (s *SoccerResolver) Name() string { return "API-Football Soccer" }
+
 func (s *SoccerResolver) CheckResolution(market polymarket.Market) (*string, float64, error) {
 	// Parse the question
 	data, err := s.ParseMarketQuestion(market.Question)

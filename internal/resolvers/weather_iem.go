@@ -114,6 +114,9 @@ var cityToAirport = map[string]string{
 //   - NO bets: place once we are past the city's typical peak hour AND the running
 //     high is clearly below the threshold (it won't recover).
 //   - Rain markets: require full day (11 PM gate) since rain can occur any time.
+// Name returns the human-readable name for this resolver.
+func (w *IEMWeatherResolver) Name() string { return "IEM ASOS Weather" }
+
 func (w *IEMWeatherResolver) CheckResolution(market polymarket.Market) (*string, float64, error) {
 	data, err := w.ParseMarketQuestion(market.Question)
 	if err != nil {

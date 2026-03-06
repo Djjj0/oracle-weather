@@ -6,9 +6,38 @@ Called by Go bot via subprocess for reliable order placement
 import sys
 import json
 import os
+import time
 from py_clob_client.client import ClobClient
 from py_clob_client.clob_types import OrderArgs
 from dotenv import load_dotenv
+
+# Cache file for derived API credentials (avoids slow re-derivation on every call)
+_CREDS_CACHE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".api_creds_cache.json")
+_CREDS_CACHE_TTL = 3600  # 1 hour in seconds
+
+
+def _load_cached_creds():
+    """Load cached API credentials if they exist and are not expired."""
+    try:
+        if not os.path.exists(_CREDS_CACHE_FILE):
+            return None
+        with open(_CREDS_CACHE_FILE, "r") as f:
+            cache = json.load(f)
+        if time.time() - cache.get("timestamp", 0) > _CREDS_CACHE_TTL:
+            return None  # Expired
+        return cache.get("creds")
+    except Exception:
+        return None
+
+
+def _save_cached_creds(creds_dict):
+    """Save API credentials to cache file."""
+    try:
+        cache = {"timestamp": time.time(), "creds": creds_dict}
+        with open(_CREDS_CACHE_FILE, "w") as f:
+            json.dump(cache, f)
+    except Exception:
+        pass  # Caching is best-effort
 
 def place_order(token_id: str, price: float, size: float, side: str) -> dict:
     """
@@ -48,8 +77,24 @@ def place_order(token_id: str, price: float, size: float, side: str) -> dict:
             funder=funder,     # Proxy wallet that holds the funds
         )
 
-        # Derive API credentials
-        client.set_api_creds(client.create_or_derive_api_creds())
+        # Derive API credentials (cached to avoid slow RPC calls on every order)
+        cached = _load_cached_creds()
+        if cached:
+            from py_clob_client.clob_types import ApiCreds
+            creds = ApiCreds(
+                api_key=cached["api_key"],
+                api_secret=cached["api_secret"],
+                api_passphrase=cached["api_passphrase"],
+            )
+            client.set_api_creds(creds)
+        else:
+            derived = client.create_or_derive_api_creds()
+            client.set_api_creds(derived)
+            _save_cached_creds({
+                "api_key": derived.api_key,
+                "api_secret": derived.api_secret,
+                "api_passphrase": derived.api_passphrase,
+            })
 
         # Create order
         order_args = OrderArgs(

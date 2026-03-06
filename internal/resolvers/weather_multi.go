@@ -39,6 +39,9 @@ func NewMultiSourceWeatherResolver(cfg *config.Config) *MultiSourceWeatherResolv
 	}
 }
 
+// Name returns the human-readable name for this resolver.
+func (w *MultiSourceWeatherResolver) Name() string { return "Multi-Source Weather (IEM)" }
+
 // CheckResolution validates weather via IEM ASOS only (Polymarket's official source)
 func (w *MultiSourceWeatherResolver) CheckResolution(market polymarket.Market) (*string, float64, error) {
 	data, err := w.ParseMarketQuestion(market.Question)

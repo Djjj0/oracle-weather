@@ -113,6 +113,54 @@ func DailyPnLReportMessage(date string, wins, losses, totalTrades int, yesterday
 	)
 }
 
+// ScanSummaryMessage creates a formatted Discord message summarising a single scan cycle.
+func ScanSummaryMessage(marketsScanned, withResolver, passedThreshold, opportunities int, skipReasons map[string]int) string {
+	skipped := 0
+	for _, v := range skipReasons {
+		skipped += v
+	}
+
+	msg := fmt.Sprintf(
+		"🔍 **Scan Complete**\n"+
+			"─────────────────────\n"+
+			"📊 Markets scanned: %d\n"+
+			"🔎 Had resolver: %d\n"+
+			"✅ Passed threshold: %d\n"+
+			"⏭️  Skipped: %d\n",
+		marketsScanned, withResolver, passedThreshold, skipped,
+	)
+
+	if len(skipReasons) > 0 {
+		reasonLabels := map[string]string{
+			"no_resolver":      "No resolver",
+			"market_filter":    "Market filter",
+			"resolution_error": "Resolution error",
+			"not_resolvable":   "Not resolvable",
+			"low_confidence":   "Low confidence",
+			"invalid_prices":   "Invalid prices",
+			"dead_market":      "Dead market",
+			"low_edge":         "Edge too low",
+			"no_token_id":      "No token ID",
+		}
+		msg += "─────────────────────\n**Skip breakdown:**\n"
+		for reason, count := range skipReasons {
+			label, ok := reasonLabels[reason]
+			if !ok {
+				label = reason
+			}
+			msg += fmt.Sprintf("  • %s: %d\n", label, count)
+		}
+	}
+
+	msg += "─────────────────────\n"
+	if opportunities > 0 {
+		msg += fmt.Sprintf("🎯 **Opportunities found: %d**", opportunities)
+	} else {
+		msg += "💤 No opportunities this cycle"
+	}
+	return msg
+}
+
 // DailySummaryMessage creates a daily summary message
 func DailySummaryMessage(date string, totalTrades, successfulTrades int, totalProfit float64) string {
 	successRate := 0.0

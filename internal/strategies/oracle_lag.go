@@ -34,47 +34,77 @@ const (
 	ReEntryPositionMultiplier = 0.5
 )
 
+// tradeRecord stores metadata about a trade for re-entry tracking
+type tradeRecord struct {
+	firstTradeTime time.Time
+	reEntryDone    bool
+}
+
+// TradeStatus indicates whether a trade should be blocked, allowed as re-entry, or new
+type TradeStatus int
+
+const (
+	TradeStatusNew     TradeStatus = iota // No prior trade, full size
+	TradeStatusReEntry                    // 1-4h after first trade, 50% size
+	TradeStatusBlocked                    // < 1h or re-entry already done
+)
+
 // ExecutedTrades tracks recently executed trades to prevent duplicates
 type ExecutedTrades struct {
-	trades map[string]time.Time // marketID:outcome -> execution time
+	trades map[string]tradeRecord // marketID:outcome -> record
 	mu     sync.RWMutex
 }
 
 // NewExecutedTrades creates a new executed trades tracker
 func NewExecutedTrades() *ExecutedTrades {
 	return &ExecutedTrades{
-		trades: make(map[string]time.Time),
+		trades: make(map[string]tradeRecord),
 	}
 }
 
-// AlreadyExecuted checks if a trade was recently executed
-func (et *ExecutedTrades) AlreadyExecuted(marketID, outcome string) bool {
+// CheckTradeStatus returns whether a trade is new, a valid re-entry, or blocked
+func (et *ExecutedTrades) CheckTradeStatus(marketID, outcome string) TradeStatus {
 	et.mu.RLock()
 	defer et.mu.RUnlock()
 
 	key := marketID + ":" + outcome
-
-	if execTime, exists := et.trades[key]; exists {
-		// Only allow re-execution if more than 1 hour passed
-		if time.Since(execTime) < MinReExecutionDelay {
-			return true
-		}
+	rec, exists := et.trades[key]
+	if !exists {
+		return TradeStatusNew
 	}
 
-	return false
+	elapsed := time.Since(rec.firstTradeTime)
+	if elapsed < MinReExecutionDelay {
+		return TradeStatusBlocked // Too soon
+	}
+	if elapsed > ReEntryHardLimit || rec.reEntryDone {
+		return TradeStatusNew // Past hard limit or re-entry already done — treat as fresh
+	}
+	return TradeStatusReEntry
+}
+
+// AlreadyExecuted checks if a trade was recently executed (kept for compatibility)
+func (et *ExecutedTrades) AlreadyExecuted(marketID, outcome string) bool {
+	return et.CheckTradeStatus(marketID, outcome) == TradeStatusBlocked
 }
 
 // RecordExecution records a trade execution
-func (et *ExecutedTrades) RecordExecution(marketID, outcome string) {
+func (et *ExecutedTrades) RecordExecution(marketID, outcome string, isReEntry bool) {
 	et.mu.Lock()
 	defer et.mu.Unlock()
 
 	key := marketID + ":" + outcome
-	et.trades[key] = time.Now()
+	rec, exists := et.trades[key]
+	if !exists || time.Since(rec.firstTradeTime) > ReEntryHardLimit {
+		et.trades[key] = tradeRecord{firstTradeTime: time.Now()}
+	} else if isReEntry {
+		rec.reEntryDone = true
+		et.trades[key] = rec
+	}
 
 	// Clean up old entries (>24 hours) - prevent memory leak
-	for k, t := range et.trades {
-		if time.Since(t) > ExecutedTradesCleanup {
+	for k, r := range et.trades {
+		if time.Since(r.firstTradeTime) > ExecutedTradesCleanup {
 			delete(et.trades, k)
 		}
 	}
@@ -323,8 +353,8 @@ func (s *OracleLagStrategy) ScanOpportunities(ctx context.Context) (<-chan Oppor
 
 				// Apply market quality filter
 				if shouldSkip, filterReason := s.marketFilter.ShouldSkip(m); shouldSkip {
-					utils.Logger.Debugf("Skipping market %s: %s", m.Question, filterReason)
-					localSkip("market_filter")
+					utils.Logger.Infof("SKIP [market_filter] %q: %s", m.Question, filterReason)
+					localSkip("market_filter: " + filterReason)
 					return
 				}
 
@@ -334,28 +364,29 @@ func (s *OracleLagStrategy) ScanOpportunities(ctx context.Context) (<-chan Oppor
 				if resolver == nil {
 					resolver = s.factory.GetResolverByQuestion(m.Question)
 					if resolver == nil {
-						utils.Logger.Debugf("No resolver found for market: %s", m.Question)
+						utils.Logger.Infof("SKIP [no_resolver] %q: no resolver matched category=%s", m.Question, category)
 						localSkip("no_resolver")
 						return
 					}
 				}
+				resolverName := resolver.Name()
 
 				// Check if market can be resolved
 				outcome, confidence, err := resolver.CheckResolution(m)
 				if err != nil {
-					utils.Logger.Debugf("Resolution check failed for %s: %v", m.Question, err)
+					utils.Logger.Infof("SKIP [resolution_error] %q via %s: %v", m.Question, resolverName, err)
 					localSkip("resolution_error")
 					return
 				}
 
 				if outcome == nil {
-					utils.Logger.Debugf("Market not yet resolvable: %s", m.Question)
+					utils.Logger.Infof("SKIP [not_resolvable] %q via %s: data not yet available", m.Question, resolverName)
 					localSkip("not_resolvable")
 					return
 				}
 
 				if confidence < 0.66 {
-					utils.Logger.Debugf("SKIP [low confidence] %s: confidence=%.1f%%", m.Question, confidence*100)
+					utils.Logger.Infof("SKIP [low_confidence] %q via %s: confidence=%.1f%% (need >=66%%)", m.Question, resolverName, confidence*100)
 					localSkip("low_confidence")
 					return
 				}
@@ -364,13 +395,13 @@ func (s *OracleLagStrategy) ScanOpportunities(ctx context.Context) (<-chan Oppor
 				noPrice := s.getCurrentPrice(m, "NO")
 
 				if yesPrice <= 0 || noPrice <= 0 {
-					utils.Logger.Debugf("SKIP [invalid prices] %s: YES=$%.2f NO=$%.2f", m.Question, yesPrice, noPrice)
+					utils.Logger.Infof("SKIP [invalid_prices] %q: YES=$%.2f NO=$%.2f", m.Question, yesPrice, noPrice)
 					localSkip("invalid_prices")
 					return
 				}
 
 				if yesPrice < 0.05 || noPrice < 0.05 {
-					utils.Logger.Debugf("SKIP [dead market] %s: YES=$%.2f NO=$%.2f", m.Question, yesPrice, noPrice)
+					utils.Logger.Infof("SKIP [dead_market] %q: YES=$%.2f NO=$%.2f (one side near zero)", m.Question, yesPrice, noPrice)
 					localSkip("dead_market")
 					return
 				}
@@ -387,8 +418,8 @@ func (s *OracleLagStrategy) ScanOpportunities(ctx context.Context) (<-chan Oppor
 
 				dynamicThreshold := s.getDynamicThreshold()
 				if bestEdge < dynamicThreshold {
-					utils.Logger.Debugf("SKIP [edge too low] %s: edge=%.2f%% threshold=%.2f%%",
-						m.Question, bestEdge*100, dynamicThreshold*100)
+					utils.Logger.Infof("SKIP [low_edge] %q via %s: edge=%.2f%% threshold=%.2f%%",
+						m.Question, resolverName, bestEdge*100, dynamicThreshold*100)
 					localSkip("low_edge")
 					return
 				}
@@ -397,15 +428,15 @@ func (s *OracleLagStrategy) ScanOpportunities(ctx context.Context) (<-chan Oppor
 
 				tokenID := s.getTokenIDForOutcome(m, bestOutcome)
 				if tokenID == "" {
-					utils.Logger.Debugf("SKIP [no token ID] %s", m.Question)
+					utils.Logger.Infof("SKIP [no_token_id] %q: no ERC1155 token ID for outcome %s", m.Question, bestOutcome)
 					localSkip("no_token_id")
 					return
 				}
 
 				confidenceMargin := confidence - 0.5
 				reasoning := fmt.Sprintf(
-					"Resolver outcome: %s\n  Confidence: %.0f%% (margin: +%.1f%% above 50%%)\n  Edge: %.1f%% (price: $%.2f)\n  Expected profit: %.1f%%\n  Data source: IEM ASOS",
-					bestOutcome, confidence*100, confidenceMargin*100, bestEdge*100, bestPrice, expectedProfit*100,
+					"Resolver: %s\n  Outcome: %s (confidence: %.0f%%, margin: +%.1f%% above 50%%)\n  Market price: $%.2f\n  Edge: %.1f%%\n  Expected profit after fees: %.1f%%\n  Passed filters: market_quality, confidence>=66%%, edge>=%.1f%%",
+					resolverName, bestOutcome, confidence*100, confidenceMargin*100, bestPrice, bestEdge*100, expectedProfit*100, dynamicThreshold*100,
 				)
 
 				opp := Opportunity{
@@ -450,7 +481,16 @@ func (s *OracleLagStrategy) ScanOpportunities(ctx context.Context) (<-chan Oppor
 
 		wg.Wait()
 
-		utils.Logger.Info("Opportunity scan complete")
+		// Log scan summary with per-filter skip breakdown
+		utils.Logger.Infof("Scan complete: scanned=%d opportunities=%d skipped=%d",
+			result.MarketsScanned, result.Opportunities, result.Skipped)
+		if len(result.SkipReasons) > 0 {
+			utils.Logger.Info("Skip reason breakdown:")
+			for reason, count := range result.SkipReasons {
+				utils.Logger.Infof("  %-40s %d", reason, count)
+			}
+		}
+
 		resultChan <- result
 	}()
 
@@ -466,10 +506,16 @@ func (s *OracleLagStrategy) ExecuteOpportunity(ctx context.Context, opp Opportun
 		return fmt.Errorf("circuit breaker tripped: %s", reason)
 	}
 
-	// PHASE 7: Check for duplicate trades
-	if s.executedTrades.AlreadyExecuted(opp.MarketID, opp.Outcome) {
+	// Check for duplicate / re-entry
+	tradeStatus := s.executedTrades.CheckTradeStatus(opp.MarketID, opp.Outcome)
+	isReEntry := false
+	switch tradeStatus {
+	case TradeStatusBlocked:
 		utils.Logger.Infof("⏭️  Skipping - already executed this opportunity within last hour")
 		return nil
+	case TradeStatusReEntry:
+		isReEntry = true
+		utils.Logger.Infof("🔄 Re-entry detected for %s — will use 50%% position size", opp.MarketQuestion)
 	}
 
 	utils.Logger.Infof("💰 Executing opportunity: %s", opp.MarketQuestion)
@@ -527,6 +573,10 @@ func (s *OracleLagStrategy) ExecuteOpportunity(ctx context.Context, opp Opportun
 
 	// Calculate position size based on edge, confidence, live balance, and market question
 	positionSize := s.calculatePositionSize(opp.Confidence, opp.Edge, balance, opp.MarketQuestion)
+	if isReEntry {
+		positionSize *= ReEntryPositionMultiplier
+		utils.Logger.Infof("🔄 Re-entry position size: $%.2f (50%% of normal)", positionSize)
+	}
 
 	utils.Logger.Infof("Position size: $%.2f (%.0f%% of max due to %.1f%% confidence, %.1f%% edge)",
 		positionSize, (positionSize/s.config.MaxPositionSize)*100, opp.Confidence*100, opp.Edge*100)
@@ -636,8 +686,8 @@ func (s *OracleLagStrategy) ExecuteOpportunity(ctx context.Context, opp Opportun
 		return fmt.Errorf("circuit breaker error: %w", err)
 	}
 
-	// PHASE 7: Record execution to prevent duplicates
-	s.executedTrades.RecordExecution(opp.MarketID, opp.Outcome)
+	// Record execution to prevent duplicates / track re-entry
+	s.executedTrades.RecordExecution(opp.MarketID, opp.Outcome, isReEntry)
 
 	// Send notification if configured
 	if s.config.DiscordWebhookURL != "" {

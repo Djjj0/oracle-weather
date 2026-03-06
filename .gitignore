@@ -17,6 +17,9 @@ data/trades.db.backup
 !data/.gitkeep
 !data/logs/.gitkeep
 
+# Python API credential cache (contains sensitive keys, regenerated automatically)
+scripts/.api_creds_cache.json
+
 # Runtime files
 bot.log
 bot.out
