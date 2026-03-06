@@ -21,7 +21,8 @@ type IEMWeatherResolver struct {
 	config     *config.Config
 	client     *resty.Client
 	cache      sync.Map
-	learningDB *pkgweather.LearningDB
+	learningDB *pkgweather.LearningDB // US cities
+	intlDB     *pkgweather.LearningDB // International cities
 }
 
 // NewIEMWeatherResolver creates a new IEM weather resolver
@@ -31,11 +32,17 @@ func NewIEMWeatherResolver(cfg *config.Config) *IEMWeatherResolver {
 		utils.Logger.Warnf("IEM resolver: could not open learning DB (peak times will use defaults): %v", err)
 		learningDB = nil
 	}
+	intlDB, err := pkgweather.NewLearningDB("./data/learning_international.db")
+	if err != nil {
+		utils.Logger.Warnf("IEM resolver: could not open international learning DB: %v", err)
+		intlDB = nil
+	}
 	return &IEMWeatherResolver{
 		config:     cfg,
 		client:     resty.New().SetTimeout(15 * time.Second),
 		cache:      sync.Map{},
 		learningDB: learningDB,
+		intlDB:     intlDB,
 	}
 }
 
@@ -209,15 +216,6 @@ func (w *IEMWeatherResolver) CheckResolution(market polymarket.Market) (*string,
 	utils.Logger.Debugf("IEM running high: %s (%s) on %s = %.1f%s at %.1f local hour",
 		data.Location, airportCode, data.Date.Format("2006-01-02"), runningHigh, unitSymbol, currentHour)
 
-	// Enforce hard minimum trading hour regardless of learning DB data.
-	// This prevents early NO bets on days when the temperature hasn't peaked yet.
-	hardFloor := float64(cityMinTradingHour(data.Location))
-	if currentHour < hardFloor {
-		utils.Logger.Infof("⏳ Too early to trade %s: %.1f local hour < %.0f gate",
-			data.Location, currentHour, hardFloor)
-		return nil, 0, nil
-	}
-
 	// Determine typical peak hour for this city from learning DB
 	// Falls back to 15.0 (3 PM) if not yet in DB
 	typicalPeakHour := w.getTypicalPeakHour(data.Location, loc)
@@ -242,14 +240,21 @@ func (w *IEMWeatherResolver) CheckResolution(market polymarket.Market) (*string,
 // getTypicalPeakHour returns the typical hour (local time) when the daily high is reached
 // for a given city, using the learning DB. Falls back to 15.0 (3 PM) if no data.
 func (w *IEMWeatherResolver) getTypicalPeakHour(city string, loc *time.Location) float64 {
-	if w.learningDB == nil {
-		return 15.0
+	cityLC := strings.ToLower(city)
+
+	// Check US DB first
+	if w.learningDB != nil {
+		if stats, err := w.learningDB.GetCityStats(cityLC); err == nil && stats.TotalMarkets >= 5 {
+			return stats.AvgHighTempHour
+		}
 	}
-	stats, err := w.learningDB.GetCityStats(strings.ToLower(city))
-	if err != nil || stats.TotalMarkets < 5 {
-		return 15.0 // Not enough data yet
+	// Fall back to international DB
+	if w.intlDB != nil {
+		if stats, err := w.intlDB.GetCityStats(cityLC); err == nil && stats.TotalMarkets >= 5 {
+			return stats.AvgHighTempHour
+		}
 	}
-	return stats.AvgHighTempHour
+	return 15.0 // Default: 3pm if no data
 }
 
 // determineOutcomeWithPeak decides whether to bet YES or NO based on:
