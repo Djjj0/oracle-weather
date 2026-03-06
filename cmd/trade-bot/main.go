@@ -15,8 +15,8 @@ import (
 	"github.com/djbro/oracle-weather/internal/strategies"
 	"github.com/djbro/oracle-weather/pkg/polymarket"
 	"github.com/djbro/oracle-weather/pkg/utils"
+	bolt "go.etcd.io/bbolt"
 	"github.com/sirupsen/logrus"
-
 )
 
 func main() {
@@ -103,6 +103,9 @@ func main() {
 	// Run position claimer in background goroutine
 	go runPositionClaimer(ctx, strategy, logger)
 
+	// Run daily P&L report at 8am every morning
+	go runDailyReport(ctx, db, cfg, logger)
+
 	runOracleLagStrategy(ctx, strategy, logger, cfg)
 }
 
@@ -150,10 +153,76 @@ func runPositionClaimer(ctx context.Context, strategy *strategies.OracleLagStrat
 	}
 }
 
+// runDailyReport fires at 8am local time every day and sends a Discord P&L report
+func runDailyReport(ctx context.Context, db *bolt.DB, cfg *config.Config, logger *logrus.Logger) {
+	const goalAmount = 200.0 // target profit in USD
+
+	for {
+		// Calculate time until next 8am local time
+		now := time.Now()
+		next8am := time.Date(now.Year(), now.Month(), now.Day(), 8, 0, 0, 0, now.Location())
+		if !next8am.After(now) {
+			next8am = next8am.Add(24 * time.Hour)
+		}
+		wait := time.Until(next8am)
+
+		logger.Infof("Daily report scheduled in %s (at %s)", wait.Round(time.Minute), next8am.Format("2006-01-02 15:04:05"))
+
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(wait):
+		}
+
+		// Gather yesterday's stats
+		yesterday := time.Now().AddDate(0, 0, -1).Format("2006-01-02")
+		dateLabel := time.Now().AddDate(0, 0, -1).Format("January 2")
+
+		dailyStats, err := database.GetDailyStatsByDate(db, yesterday)
+		if err != nil {
+			logger.Errorf("Daily report: failed to get daily stats: %v", err)
+			dailyStats = &database.DailyStatsResult{}
+		}
+
+		allTimeProfit, err := database.GetAllTimeProfit(db)
+		if err != nil {
+			logger.Errorf("Daily report: failed to get all-time profit: %v", err)
+		}
+
+		openPositions, err := database.GetOpenPositions(db)
+		if err != nil {
+			logger.Errorf("Daily report: failed to get open positions: %v", err)
+		}
+
+		msg := utils.DailyPnLReportMessage(
+			dateLabel,
+			dailyStats.Wins,
+			dailyStats.Losses,
+			dailyStats.TotalTrades,
+			dailyStats.TotalProfit,
+			allTimeProfit,
+			goalAmount,
+			len(openPositions),
+		)
+
+		logger.Infof("Sending daily P&L report:\n%s", msg)
+
+		if cfg.DiscordWebhookURL != "" {
+			if err := utils.SendDiscordNotification(cfg.DiscordWebhookURL, msg); err != nil {
+				logger.Errorf("Daily report: failed to send Discord notification: %v", err)
+			} else {
+				logger.Info("Daily P&L report sent to Discord")
+			}
+		} else {
+			logger.Warn("Daily report: DISCORD_WEBHOOK_URL not configured, skipping notification")
+		}
+	}
+}
+
 func scanAndExecute(ctx context.Context, strategy *strategies.OracleLagStrategy, logger *logrus.Logger) {
 	logger.Info("Starting scan for opportunities...")
 
-	opportunities := strategy.ScanOpportunities(ctx)
+	opportunities, _ := strategy.ScanOpportunities(ctx)
 	count := 0
 
 	for opp := range opportunities {

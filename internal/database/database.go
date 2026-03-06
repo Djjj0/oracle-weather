@@ -179,6 +179,86 @@ func GetDailyStats(db *bolt.DB) (*DailyStats, error) {
 	return stats, nil
 }
 
+// DailyStatsResult holds wins, losses, and profit for a date range
+type DailyStatsResult struct {
+	Wins        int
+	Losses      int
+	TotalTrades int
+	TotalProfit float64
+}
+
+// GetDailyStatsByDate retrieves wins, losses, and profit for all positions closed on a given date
+func GetDailyStatsByDate(db *bolt.DB, date string) (*DailyStatsResult, error) {
+	result := &DailyStatsResult{}
+
+	err := db.View(func(tx *bolt.Tx) error {
+		b := tx.Bucket(positionsBucket)
+		if b == nil {
+			return nil
+		}
+
+		c := b.Cursor()
+		for k, v := c.First(); k != nil; k, v = c.Next() {
+			var pos Position
+			if err := json.Unmarshal(v, &pos); err != nil {
+				continue
+			}
+
+			// Only count positions closed (CLAIMED or LOST) on the given date
+			if pos.Status == "OPEN" {
+				continue
+			}
+			if pos.ClaimedAt.Format("2006-01-02") != date {
+				continue
+			}
+
+			result.TotalTrades++
+			result.TotalProfit += pos.Profit
+			if pos.Profit > 0 {
+				result.Wins++
+			} else {
+				result.Losses++
+			}
+		}
+
+		return nil
+	})
+
+	if err != nil {
+		return nil, err
+	}
+
+	return result, nil
+}
+
+// GetAllTimeProfit sums profit across all closed positions (CLAIMED and LOST)
+func GetAllTimeProfit(db *bolt.DB) (float64, error) {
+	var total float64
+
+	err := db.View(func(tx *bolt.Tx) error {
+		b := tx.Bucket(positionsBucket)
+		if b == nil {
+			return nil
+		}
+
+		c := b.Cursor()
+		for k, v := c.First(); k != nil; k, v = c.Next() {
+			var pos Position
+			if err := json.Unmarshal(v, &pos); err != nil {
+				continue
+			}
+
+			if pos.Status == "CLAIMED" || pos.Status == "LOST" {
+				total += pos.Profit
+			}
+		}
+
+		return nil
+	})
+
+	return total, err
+}
+
 // GetRecentOpportunities retrieves recent opportunities
 func GetRecentOpportunities(db *bolt.DB, limit int) ([]Opportunity, error) {
 	var opportunities []Opportunity

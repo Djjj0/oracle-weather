@@ -2,6 +2,7 @@ package utils
 
 import (
 	"fmt"
+	"strings"
 
 	"github.com/go-resty/resty/v2"
 )
@@ -47,14 +48,69 @@ func OpportunityFoundMessage(marketQuestion, outcome string, currentPrice, expec
 		marketQuestion, outcome, currentPrice, expectedProfit*100)
 }
 
-// TradeExecutedMessage creates a formatted message for a trade
-func TradeExecutedMessage(marketQuestion, outcome string, entryPrice, positionSize float64) string {
-	return fmt.Sprintf("💰 **Trade Executed**\n"+
-		"Market: %s\n"+
-		"Outcome: %s\n"+
-		"Entry Price: $%.2f\n"+
-		"Position: $%.2f",
-		marketQuestion, outcome, entryPrice, positionSize)
+// TradeExecutedMessage creates a rich Discord notification for a placed trade.
+// reasoning is a multi-line string (produced in ScanOpportunities) explaining the decision.
+func TradeExecutedMessage(marketQuestion, outcome string, entryPrice, positionSize, expectedProfit, confidence float64, reasoning string) string {
+	msg := fmt.Sprintf(
+		"🤖 **Trade Placed**\n"+
+			"📋 **Market:** %s\n"+
+			"✅ **Outcome:** %s\n"+
+			"💵 **Entry price:** $%.2f\n"+
+			"📐 **Position size:** $%.2f\n"+
+			"─────────────────────\n"+
+			"🧠 **Why placed:**\n",
+		marketQuestion, outcome, entryPrice, positionSize,
+	)
+	if reasoning != "" {
+		// reasoning lines are already formatted; indent each line as a bullet
+		for _, line := range strings.Split(reasoning, "\n") {
+			if line == "" {
+				continue
+			}
+			msg += fmt.Sprintf("  • %s\n", strings.TrimSpace(line))
+		}
+	} else {
+		msg += fmt.Sprintf(
+			"  • Confidence: %.0f%%\n"+
+				"  • Edge leads to expected profit: %.1f%%\n",
+			confidence*100, expectedProfit*100,
+		)
+	}
+	return msg
+}
+
+// DailyPnLReportMessage creates the formatted 8am daily P&L report
+func DailyPnLReportMessage(date string, wins, losses, totalTrades int, yesterdayPnL, allTimePnL, goalAmount float64, openPositions int) string {
+	goalProgress := 0.0
+	if goalAmount > 0 {
+		goalProgress = allTimePnL / goalAmount * 100
+	}
+
+	sign := "+"
+	if yesterdayPnL < 0 {
+		sign = ""
+	}
+
+	allTimeSign := "+"
+	if allTimePnL < 0 {
+		allTimeSign = ""
+	}
+
+	return fmt.Sprintf(
+		"📈 Daily P&L Report — %s\n"+
+			"─────────────────────────────\n"+
+			"Yesterday's trades: %d\n"+
+			"✅ Wins: %d  ❌ Losses: %d\n"+
+			"💰 Yesterday P&L: %s$%.2f\n"+
+			"📊 All-time P&L: %s$%.2f\n"+
+			"🎯 Goal progress: $%.2f / $%.2f (%.1f%%)\n"+
+			"📂 Open positions: %d",
+		date, totalTrades, wins, losses,
+		sign, yesterdayPnL,
+		allTimeSign, allTimePnL,
+		allTimePnL, goalAmount, goalProgress,
+		openPositions,
+	)
 }
 
 // DailySummaryMessage creates a daily summary message

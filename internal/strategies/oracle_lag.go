@@ -28,6 +28,10 @@ const (
 	MinReExecutionDelay = 1 * time.Hour
 	// Cleanup old executed trades after 24 hours
 	ExecutedTradesCleanup = 24 * time.Hour
+	// Hard limit: never re-enter within 4 hours of an existing open position entry
+	ReEntryHardLimit = 4 * time.Hour
+	// Re-entry position size multiplier (50% of normal size)
+	ReEntryPositionMultiplier = 0.5
 )
 
 // ExecutedTrades tracks recently executed trades to prevent duplicates
@@ -76,6 +80,15 @@ func (et *ExecutedTrades) RecordExecution(marketID, outcome string) {
 	}
 }
 
+// ScanResult holds statistics from a single scan cycle
+type ScanResult struct {
+	MarketsScanned int
+	Opportunities  int
+	Executed       int
+	Skipped        int
+	SkipReasons    map[string]int // reason -> count
+}
+
 // Opportunity represents a trading opportunity
 type Opportunity struct {
 	MarketID       string
@@ -88,6 +101,7 @@ type Opportunity struct {
 	Confidence     float64
 	Lag            time.Duration
 	Timestamp      time.Time
+	Reasoning      string // Human-readable explanation of why this trade was selected
 }
 
 // TemperatureBucket represents a temperature range bucket
@@ -241,18 +255,26 @@ func NewStrategy(
 	}
 }
 
-// ScanOpportunities scans for arbitrage opportunities
-func (s *OracleLagStrategy) ScanOpportunities(ctx context.Context) <-chan Opportunity {
-	opportunitiesChan := make(chan Opportunity, 10)
+// ScanOpportunities scans for arbitrage opportunities.
+// It returns two channels: one for opportunities and one for the final ScanResult
+// (which receives exactly one value after the scan goroutine finishes).
+func (s *OracleLagStrategy) ScanOpportunities(ctx context.Context) (<-chan Opportunity, <-chan ScanResult) {
+	opportunitiesChan := make(chan Opportunity, 50)
+	resultChan := make(chan ScanResult, 1)
 
 	go func() {
 		defer close(opportunitiesChan)
+		defer close(resultChan)
 
+		result := ScanResult{
+			SkipReasons: make(map[string]int),
+		}
 		// Check circuit breaker first
 		canTrade, reason := s.circuitBreaker.CanTrade()
 		if !canTrade {
 			utils.Logger.Errorf("🚨 Circuit breaker is tripped: %s", reason)
 			utils.Logger.Error("Trading is DISABLED. Reset required.")
+			resultChan <- result
 			return
 		}
 
@@ -261,149 +283,178 @@ func (s *OracleLagStrategy) ScanOpportunities(ctx context.Context) <-chan Opport
 		markets, err := s.monitor.GetMarketsPastResolution(ctx)
 		if err != nil {
 			utils.Logger.Errorf("Failed to get markets: %v", err)
+			resultChan <- result
 			return
 		}
 
+		result.MarketsScanned = len(markets)
 		utils.Logger.Infof("Checking %d markets for opportunities...", len(markets))
 
-		// Check each market
+		// Concurrent market scanning: up to 10 simultaneous IEM requests
+		sem := make(chan struct{}, 10)
+		var wg sync.WaitGroup
+		var resultMu sync.Mutex
+
 		for _, market := range markets {
 			select {
 			case <-ctx.Done():
-				return
+				break
 			default:
 			}
 
-			// Apply market quality filter
-			if shouldSkip, reason := s.marketFilter.ShouldSkip(market); shouldSkip {
-				utils.Logger.Debugf("Skipping market %s: %s", market.Question, reason)
-				continue
-			}
+			wg.Add(1)
+			go func(m polymarket.Market) {
+				defer wg.Done()
+				sem <- struct{}{}
+				defer func() { <-sem }()
 
-			// Get appropriate resolver
-			category := s.monitor.CategorizeMarket(market)
-			resolver := s.factory.GetResolver(category)
-			if resolver == nil {
-				// Try auto-detection from question
-				resolver = s.factory.GetResolverByQuestion(market.Question)
-				if resolver == nil {
-					utils.Logger.Debugf("No resolver found for market: %s", market.Question)
-					continue
+				select {
+				case <-ctx.Done():
+					return
+				default:
 				}
-			}
 
-			// Check if market can be resolved
-			outcome, confidence, err := resolver.CheckResolution(market)
-			if err != nil {
-				utils.Logger.Debugf("Resolution check failed for %s: %v", market.Question, err)
-				continue
-			}
+				localSkip := func(reason string) {
+					resultMu.Lock()
+					result.Skipped++
+					result.SkipReasons[reason]++
+					resultMu.Unlock()
+				}
 
-			if outcome == nil {
-				utils.Logger.Debugf("Market not yet resolvable: %s", market.Question)
-				continue
-			}
+				// Apply market quality filter
+				if shouldSkip, filterReason := s.marketFilter.ShouldSkip(m); shouldSkip {
+					utils.Logger.Debugf("Skipping market %s: %s", m.Question, filterReason)
+					localSkip("market_filter")
+					return
+				}
 
-			// Skip if confidence is too low (< 66%)
-			if confidence < 0.66 {
-				utils.Logger.Debugf("Skipping %s: confidence too low (%.1f%%)", market.Question, confidence*100)
-				continue
-			}
+				// Get appropriate resolver
+				category := s.monitor.CategorizeMarket(m)
+				resolver := s.factory.GetResolver(category)
+				if resolver == nil {
+					resolver = s.factory.GetResolverByQuestion(m.Question)
+					if resolver == nil {
+						utils.Logger.Debugf("No resolver found for market: %s", m.Question)
+						localSkip("no_resolver")
+						return
+					}
+				}
 
-			// Get market prices for both YES and NO outcomes
-			yesPrice := s.getCurrentPrice(market, "YES")
-			noPrice := s.getCurrentPrice(market, "NO")
+				// Check if market can be resolved
+				outcome, confidence, err := resolver.CheckResolution(m)
+				if err != nil {
+					utils.Logger.Debugf("Resolution check failed for %s: %v", m.Question, err)
+					localSkip("resolution_error")
+					return
+				}
 
-			// Validate prices
-			if yesPrice <= 0 || noPrice <= 0 {
-				utils.Logger.Debugf("Invalid prices for market: %s (YES: $%.2f, NO: $%.2f)", market.Question, yesPrice, noPrice)
-				continue
-			}
+				if outcome == nil {
+					utils.Logger.Debugf("Market not yet resolvable: %s", m.Question)
+					localSkip("not_resolvable")
+					return
+				}
 
-			// Skip dead/stale markets (prices below 5 cents indicate no real trading activity)
-			// These markets often have $0.00 or $0.01 prices which create false "opportunities"
-			if yesPrice < 0.05 || noPrice < 0.05 {
-				utils.Logger.Debugf("Dead market (price < $0.05) skipped: %s (YES: $%.2f, NO: $%.2f)",
-					market.Question, yesPrice, noPrice)
-				continue
-			}
+				if confidence < 0.66 {
+					utils.Logger.Debugf("SKIP [low confidence] %s: confidence=%.1f%%", m.Question, confidence*100)
+					localSkip("low_confidence")
+					return
+				}
 
-			// Always bet what the resolver determined (YES or NO)
-			// Edge is calculated purely to confirm the market hasn't already priced in the outcome
-			bestOutcome := *outcome
-			var bestPrice, bestEdge float64
-			if bestOutcome == "Yes" {
-				bestPrice = yesPrice
-				bestEdge = confidence - yesPrice
-			} else {
-				bestPrice = noPrice
-				bestEdge = (1.0 - confidence) - noPrice
-			}
+				yesPrice := s.getCurrentPrice(m, "YES")
+				noPrice := s.getCurrentPrice(m, "NO")
 
-			// Log edge analysis
-			utils.Logger.Debugf("📊 Edge Analysis: %s", market.Question)
-			utils.Logger.Debugf("  Resolver outcome: %s | Confidence: %.1f%% | Price: $%.3f | Edge: %.1f%%",
-				bestOutcome, confidence*100, bestPrice, bestEdge*100)
+				if yesPrice <= 0 || noPrice <= 0 {
+					utils.Logger.Debugf("SKIP [invalid prices] %s: YES=$%.2f NO=$%.2f", m.Question, yesPrice, noPrice)
+					localSkip("invalid_prices")
+					return
+				}
 
-			// Use dynamic profit threshold (convert to edge threshold)
-			dynamicThreshold := s.getDynamicThreshold()
-			if bestEdge < dynamicThreshold {
-				utils.Logger.Debugf("  ✗ Edge too low: %.2f%% < %.2f%% threshold",
-					bestEdge*100, dynamicThreshold*100)
-				continue
-			}
+				if yesPrice < 0.05 || noPrice < 0.05 {
+					utils.Logger.Debugf("SKIP [dead market] %s: YES=$%.2f NO=$%.2f", m.Question, yesPrice, noPrice)
+					localSkip("dead_market")
+					return
+				}
 
-			// Calculate expected profit: edge minus flat Polymarket fee
-			expectedProfit := bestEdge - PolymarketFee
+				bestOutcome := *outcome
+				var bestPrice, bestEdge float64
+				if bestOutcome == "Yes" {
+					bestPrice = yesPrice
+					bestEdge = confidence - yesPrice
+				} else {
+					bestPrice = noPrice
+					bestEdge = confidence - noPrice
+				}
 
-			// Find the token ID for the outcome
-			tokenID := s.getTokenIDForOutcome(market, bestOutcome)
-			if tokenID == "" {
-				utils.Logger.Debugf("No token ID found for outcome %s in market %s", bestOutcome, market.Question)
-				continue
-			}
+				dynamicThreshold := s.getDynamicThreshold()
+				if bestEdge < dynamicThreshold {
+					utils.Logger.Debugf("SKIP [edge too low] %s: edge=%.2f%% threshold=%.2f%%",
+						m.Question, bestEdge*100, dynamicThreshold*100)
+					localSkip("low_edge")
+					return
+				}
 
-			// Create opportunity with actual confidence from resolution
-			opp := Opportunity{
-				MarketID:       market.ID,
-				MarketQuestion: market.Question,
-				Outcome:        bestOutcome,
-				TokenID:        tokenID,
-				CurrentPrice:   bestPrice,
-				ExpectedProfit: expectedProfit,
-				Edge:           bestEdge,
-				Confidence:     confidence,
-				Lag:            s.monitor.CalculateLag(market),
-				Timestamp:      time.Now(),
-			}
+				expectedProfit := bestEdge - PolymarketFee
 
-			utils.Logger.Infof("🎯 OPPORTUNITY FOUND: %s | %s | Price: $%.2f | Edge: %.2f%% | Profit: %.2f%%",
-				market.Question, bestOutcome, bestPrice, bestEdge*100, expectedProfit*100)
+				tokenID := s.getTokenIDForOutcome(m, bestOutcome)
+				if tokenID == "" {
+					utils.Logger.Debugf("SKIP [no token ID] %s", m.Question)
+					localSkip("no_token_id")
+					return
+				}
 
-			// Log to database
-			dbOpp := database.Opportunity{
-				MarketID:       opp.MarketID,
-				Outcome:        opp.Outcome,
-				CurrentPrice:   opp.CurrentPrice,
-				ExpectedProfit: opp.ExpectedProfit,
-				Executed:       false,
-			}
-			if err := database.LogOpportunity(s.db, dbOpp); err != nil {
-				utils.Logger.Errorf("Failed to log opportunity: %v", err)
-			}
+				confidenceMargin := confidence - 0.5
+				reasoning := fmt.Sprintf(
+					"Resolver outcome: %s\n  Confidence: %.0f%% (margin: +%.1f%% above 50%%)\n  Edge: %.1f%% (price: $%.2f)\n  Expected profit: %.1f%%\n  Data source: IEM ASOS",
+					bestOutcome, confidence*100, confidenceMargin*100, bestEdge*100, bestPrice, expectedProfit*100,
+				)
 
-			// Send to channel
-			select {
-			case <-ctx.Done():
-				return
-			case opportunitiesChan <- opp:
-			}
+				opp := Opportunity{
+					MarketID:       m.ID,
+					MarketQuestion: m.Question,
+					Outcome:        bestOutcome,
+					TokenID:        tokenID,
+					CurrentPrice:   bestPrice,
+					ExpectedProfit: expectedProfit,
+					Edge:           bestEdge,
+					Confidence:     confidence,
+					Lag:            s.monitor.CalculateLag(m),
+					Timestamp:      time.Now(),
+					Reasoning:      reasoning,
+				}
+
+				utils.Logger.Infof("🎯 OPPORTUNITY FOUND: %s | %s | Price: $%.2f | Edge: %.2f%% | Profit: %.2f%%",
+					m.Question, bestOutcome, bestPrice, bestEdge*100, expectedProfit*100)
+
+				dbOpp := database.Opportunity{
+					MarketID:       opp.MarketID,
+					Outcome:        opp.Outcome,
+					CurrentPrice:   opp.CurrentPrice,
+					ExpectedProfit: opp.ExpectedProfit,
+					Executed:       false,
+				}
+				if err := database.LogOpportunity(s.db, dbOpp); err != nil {
+					utils.Logger.Errorf("Failed to log opportunity: %v", err)
+				}
+
+				resultMu.Lock()
+				result.Opportunities++
+				resultMu.Unlock()
+
+				select {
+				case <-ctx.Done():
+					return
+				case opportunitiesChan <- opp:
+				}
+			}(market)
 		}
 
+		wg.Wait()
+
 		utils.Logger.Info("Opportunity scan complete")
+		resultChan <- result
 	}()
 
-	return opportunitiesChan
+	return opportunitiesChan, resultChan
 }
 
 // ExecuteOpportunity executes a trading opportunity
@@ -465,8 +516,17 @@ func (s *OracleLagStrategy) ExecuteOpportunity(ctx context.Context, opp Opportun
 		opp.CurrentPrice = currentPrice
 	}
 
-	// Calculate position size based on edge and confidence
-	positionSize := s.calculatePositionSize(opp.Confidence, opp.Edge)
+	// Fetch live balance for dynamic position sizing
+	balance, balErr := s.client.GetBalance()
+	if balErr != nil {
+		utils.Logger.Warnf("Failed to fetch live balance, falling back to MaxPositionSize: %v", balErr)
+		balance = 0
+	} else {
+		utils.Logger.Infof("Live balance: $%.2f | PositionSizePct: %.1f%%", balance, s.config.PositionSizePct*100)
+	}
+
+	// Calculate position size based on edge, confidence, live balance, and market question
+	positionSize := s.calculatePositionSize(opp.Confidence, opp.Edge, balance, opp.MarketQuestion)
 
 	utils.Logger.Infof("Position size: $%.2f (%.0f%% of max due to %.1f%% confidence, %.1f%% edge)",
 		positionSize, (positionSize/s.config.MaxPositionSize)*100, opp.Confidence*100, opp.Edge*100)
@@ -581,16 +641,7 @@ func (s *OracleLagStrategy) ExecuteOpportunity(ctx context.Context, opp Opportun
 
 	// Send notification if configured
 	if s.config.DiscordWebhookURL != "" {
-		message := fmt.Sprintf("🤖 **Trade Executed**\n"+
-			"Market: %s\n"+
-			"Outcome: %s\n"+
-			"Entry Price: $%.2f\n"+
-			"Position: $%.2f\n"+
-			"Expected Profit: %.2f%%\n"+
-			"Confidence: %.1f%%",
-			opp.MarketQuestion, opp.Outcome, opp.CurrentPrice,
-			positionSize, opp.ExpectedProfit*100, opp.Confidence*100)
-
+		message := utils.TradeExecutedMessage(opp.MarketQuestion, opp.Outcome, opp.CurrentPrice, positionSize, opp.ExpectedProfit, opp.Confidence, opp.Reasoning)
 		if err := utils.SendDiscordNotification(s.config.DiscordWebhookURL, message); err != nil {
 			utils.Logger.Errorf("Failed to send notification: %v", err)
 		}
@@ -599,11 +650,23 @@ func (s *OracleLagStrategy) ExecuteOpportunity(ctx context.Context, opp Opportun
 	return nil
 }
 
-// calculatePositionSize determines position size based on confidence level and edge
-// Uses a Kelly-like approach: higher edge = larger position, higher confidence = larger position
+// calculatePositionSize determines position size based on available balance, confidence, and edge.
+// baseSize is derived from balance * PositionSizePct, capped at MaxPositionSize.
+// If balance is <= 0 (e.g. fetch failed), falls back to MaxPositionSize.
+// Rain markets are hard-capped at RainMaxPosition (default $1.00) for testing.
 // Formula: baseSize * confidenceMultiplier * edgeMultiplier
-func (s *OracleLagStrategy) calculatePositionSize(confidence float64, edge float64) float64 {
-	baseSize := s.config.MaxPositionSize
+func (s *OracleLagStrategy) calculatePositionSize(confidence float64, edge float64, balance float64, marketQuestion string) float64 {
+	var baseSize float64
+	if balance > 0 {
+		baseSize = balance * s.config.PositionSizePct
+		// Never exceed the configured hard cap
+		if baseSize > s.config.MaxPositionSize {
+			baseSize = s.config.MaxPositionSize
+		}
+	} else {
+		// Fallback when live balance is unavailable
+		baseSize = s.config.MaxPositionSize
+	}
 
 	// Confidence multiplier
 	var confidenceMultiplier float64
@@ -612,14 +675,14 @@ func (s *OracleLagStrategy) calculatePositionSize(confidence float64, edge float
 		// Very high confidence (95%+): 100%
 		confidenceMultiplier = 1.0
 	case confidence >= 0.85:
-		// High confidence (85-95%): 90%
-		confidenceMultiplier = 0.9
+		// High confidence (85-95%): 95%
+		confidenceMultiplier = 0.95
 	case confidence >= 0.75:
-		// Medium-high confidence (75-85%): 75%
-		confidenceMultiplier = 0.75
+		// Medium-high confidence (75-85%): 85%
+		confidenceMultiplier = 0.85
 	case confidence >= 0.66:
-		// Medium confidence (66-75%): 60%
-		confidenceMultiplier = 0.6
+		// Medium confidence (66-75%): 75%
+		confidenceMultiplier = 0.75
 	default:
 		// Below minimum confidence threshold: no trade (shouldn't reach here)
 		return 0
@@ -632,14 +695,14 @@ func (s *OracleLagStrategy) calculatePositionSize(confidence float64, edge float
 		// Huge edge (25%+): full size
 		edgeMultiplier = 1.0
 	case edge >= 0.15:
-		// Large edge (15-25%): 90%
-		edgeMultiplier = 0.9
+		// Large edge (15-25%): 95%
+		edgeMultiplier = 0.95
 	case edge >= 0.10:
-		// Good edge (10-15%): 75%
-		edgeMultiplier = 0.75
+		// Good edge (10-15%): 85%
+		edgeMultiplier = 0.85
 	case edge >= s.config.MinProfitThreshold:
-		// Minimum edge (threshold-10%): 50%
-		edgeMultiplier = 0.5
+		// Minimum edge (threshold-10%): 65%
+		edgeMultiplier = 0.65
 	default:
 		// Below threshold (shouldn't reach here due to earlier filter)
 		return 0
@@ -651,6 +714,19 @@ func (s *OracleLagStrategy) calculatePositionSize(confidence float64, edge float
 	// Ensure minimum size of at least $1
 	if finalSize < 1.0 && finalSize > 0 {
 		finalSize = 1.0
+	}
+
+	// Rain markets are capped at RainMaxPosition for testing
+	if strings.Contains(strings.ToLower(marketQuestion), "rain") {
+		rainCap := s.config.RainMaxPosition
+		if rainCap <= 0 {
+			rainCap = 1.0
+		}
+		if finalSize > rainCap {
+			utils.Logger.Infof("🌧️  Rain market position capped at $%.2f (was $%.2f): %s",
+				rainCap, finalSize, marketQuestion)
+			finalSize = rainCap
+		}
 	}
 
 	return finalSize

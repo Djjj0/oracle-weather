@@ -201,6 +201,39 @@ func MarkPositionLost(db *bolt.DB, positionID uint64) error {
 	})
 }
 
+// GetAllClosedPositions retrieves all positions with status CLAIMED or LOST
+func GetAllClosedPositions(db *bolt.DB) ([]Position, error) {
+	var positions []Position
+
+	err := db.View(func(tx *bolt.Tx) error {
+		b := tx.Bucket(positionsBucket)
+		if b == nil {
+			return nil // No positions yet
+		}
+
+		c := b.Cursor()
+
+		for k, v := c.First(); k != nil; k, v = c.Next() {
+			var pos Position
+			if err := json.Unmarshal(v, &pos); err != nil {
+				continue
+			}
+
+			if pos.Status == "CLAIMED" || pos.Status == "LOST" {
+				positions = append(positions, pos)
+			}
+		}
+
+		return nil
+	})
+
+	if err != nil {
+		return nil, err
+	}
+
+	return positions, nil
+}
+
 // GetTotalExposure calculates total $ exposure across all open positions
 func GetTotalExposure(db *bolt.DB) (float64, error) {
 	positions, err := GetOpenPositions(db)

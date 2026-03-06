@@ -152,7 +152,7 @@ func main() {
 				logger.Info("Scanning for weather oracle lag opportunities...")
 
 				// Scan for opportunities
-				opportunities := oracleLagStrategy.ScanOpportunities(ctx)
+				opportunities, _ := oracleLagStrategy.ScanOpportunities(ctx)
 
 				// Execute each opportunity
 				opportunityCount := 0

@@ -165,6 +165,30 @@ func (w *IEMWeatherResolver) CheckResolution(market polymarket.Market) (*string,
 		return &result.Outcome, result.Confidence, nil
 	}
 
+	// Rain/precipitation markets: use dedicated precipitation endpoint
+	if data.Condition == "rain" || data.Condition == "precipitation" {
+		totalPrecip, err := w.getIEMPrecip(airportCode, data.Date)
+		if err != nil {
+			return nil, 0, fmt.Errorf("IEM precip API error: %w", err)
+		}
+
+		localDate := data.Date.In(loc)
+		var outcome string
+		if totalPrecip > 0 {
+			outcome = "Yes"
+		} else {
+			outcome = "No"
+		}
+		// High confidence since we have the full day of data (gate already passed above)
+		confidence := 0.92
+
+		utils.Logger.Infof("✅ IEM rain resolved: %s on %s | Total precip: %.4f in | Outcome: %s | Confidence: %.0f%%",
+			data.Location, localDate.Format("2006-01-02"), totalPrecip, outcome, confidence*100)
+
+		w.cache.Store(cacheKey, CachedResult{Outcome: outcome, Confidence: confidence})
+		return &outcome, confidence, nil
+	}
+
 	// Fetch the current running high from IEM (max of all observations so far today)
 	runningHigh, err := w.getIEMHighTemp(airportCode, data.Date, useCelsius)
 	if err != nil {
@@ -454,6 +478,61 @@ func (w *IEMWeatherResolver) determineOutcome(data *MarketData, temp float64, un
 	default:
 		return "No", 0.50
 	}
+}
+
+// getIEMPrecip fetches hourly precipitation (p01i) from IEM ASOS for a given station/date
+// and returns the total precipitation in inches for that calendar day (UTC).
+// A return value > 0 means it rained; 0 means no measurable precipitation.
+func (w *IEMWeatherResolver) getIEMPrecip(station string, date time.Time) (float64, error) {
+	url := fmt.Sprintf(
+		"https://mesonet.agron.iastate.edu/cgi-bin/request/asos.py?station=%s&data=p01i&year1=%d&month1=%d&day1=%d&year2=%d&month2=%d&day2=%d&tz=UTC&format=onlycomma&latlon=no&elev=no&missing=null&trace=null&direct=no&report_type=3&report_type=4",
+		station,
+		date.Year(), int(date.Month()), date.Day(),
+		date.Year(), int(date.Month()), date.Day(),
+	)
+
+	resp, err := w.client.R().Get(url)
+	if err != nil {
+		return 0, fmt.Errorf("failed to fetch IEM precip data: %w", err)
+	}
+	if resp.IsError() {
+		return 0, fmt.Errorf("IEM precip API returned error: %s", resp.Status())
+	}
+
+	lines := strings.Split(strings.TrimSpace(resp.String()), "\n")
+	if len(lines) < 2 {
+		return 0, fmt.Errorf("no precip data returned from IEM for station %s on %s", station, date.Format("2006-01-02"))
+	}
+
+	// CSV columns: station, valid, p01i
+	// Sum all valid hourly precip values; skip null/missing
+	var totalPrecip float64
+	validReadings := 0
+	for _, line := range lines[1:] {
+		parts := strings.Split(line, ",")
+		if len(parts) < 3 {
+			continue
+		}
+		valStr := strings.TrimSpace(parts[2])
+		if valStr == "" || valStr == "null" || valStr == "M" {
+			continue
+		}
+		val, err := strconv.ParseFloat(valStr, 64)
+		if err != nil {
+			continue
+		}
+		if val >= 0 { // negative would be bogus
+			totalPrecip += val
+			validReadings++
+		}
+	}
+
+	if validReadings == 0 {
+		return 0, fmt.Errorf("no valid precip readings for %s on %s", station, date.Format("2006-01-02"))
+	}
+
+	utils.Logger.Debugf("IEM precip: %s on %s = %.4f in total (%d readings)", station, date.Format("2006-01-02"), totalPrecip, validReadings)
+	return totalPrecip, nil
 }
 
 // ParseMarketQuestion delegates to base weather resolver

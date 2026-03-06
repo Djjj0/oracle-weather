@@ -35,7 +35,15 @@ func NewMonitor(client *polymarket.PolymarketClient, config *config.Config) *Mar
 	}
 }
 
-// GetMarketsPastResolution returns markets where resolution time has passed but still ACTIVE
+// EarlyEntryWindow is how far ahead of resolution we allow entry when the IEM
+// resolver already has a confirmed outcome (e.g. running high already exceeds
+// the threshold, so resolution is a foregone conclusion).
+const EarlyEntryWindow = 2 * time.Hour
+
+// GetMarketsPastResolution returns weather markets that are eligible for trading:
+//   - Markets where resolution time has already passed (classic oracle-lag), OR
+//   - Markets resolving within the next EarlyEntryWindow (2 h) where the IEM
+//     resolver may already have a confirmed outcome based on intraday data.
 func (m *MarketMonitor) GetMarketsPastResolution(ctx context.Context) ([]polymarket.Market, error) {
 	utils.Logger.Info("Fetching active markets...")
 
@@ -47,9 +55,10 @@ func (m *MarketMonitor) GetMarketsPastResolution(ctx context.Context) ([]polymar
 
 	utils.Logger.Infof("Found %d active markets", len(markets))
 
-	// Filter markets past resolution time
+	// Filter markets past resolution time OR resolving within EarlyEntryWindow
 	var pastResolution []polymarket.Market
 	now := time.Now()
+	earlyEntryDeadline := now.Add(EarlyEntryWindow)
 
 	for _, market := range markets {
 		// Skip if not active or already resolved
@@ -63,13 +72,31 @@ func (m *MarketMonitor) GetMarketsPastResolution(ctx context.Context) ([]polymar
 			continue
 		}
 
-		// Check if resolution time has passed
-		if !market.ResolutionTimestamp.IsZero() && now.After(market.ResolutionTimestamp) {
+		if market.ResolutionTimestamp.IsZero() {
+			continue
+		}
+
+		// Include markets past resolution time (oracle-lag) OR resolving soon
+		// (early entry when IEM already has a confirmed intraday outcome).
+		pastResolutionTime := now.After(market.ResolutionTimestamp)
+		resolvingSoon := market.ResolutionTimestamp.Before(earlyEntryDeadline)
+
+		if pastResolutionTime || resolvingSoon {
 			pastResolution = append(pastResolution, market)
 		}
 	}
 
-	utils.Logger.Infof("Found %d weather markets past resolution time", len(pastResolution))
+	pastCount := 0
+	earlyCount := 0
+	for _, m := range pastResolution {
+		if now.After(m.ResolutionTimestamp) {
+			pastCount++
+		} else {
+			earlyCount++
+		}
+	}
+	utils.Logger.Infof("Found %d weather markets eligible (past resolution: %d, early entry within %v: %d)",
+		len(pastResolution), pastCount, EarlyEntryWindow, earlyCount)
 
 	return pastResolution, nil
 }

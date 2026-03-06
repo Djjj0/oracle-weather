@@ -1,0 +1,119 @@
+=== INTERNATIONAL CITIES WEATHER BACKFILL ===
+Using Visual Crossing Weather API (reliable WU alternative)
+Analyzing 1 year of data to determine optimal entry timing
+ETA: 10-15 minutes (Visual Crossing is fast!)
+
+📝 NOTE: Polymarket uses Weather Underground for resolution.
+         Visual Crossing is used here for timing analysis only.
+         For live trading, we'll verify against WU.
+
+✅ Learning database initialized
+✅ Visual Crossing client initialized
+
+🔍 Processing: London, UK
+   Location: London,UK, Timezone: Europe/London
+   📈 Progress: 30/365 days processed
+   ✅ Complete: 33 success, 332 failed
+   📊 Optimal entry time: 23:30 Europe/London
+
+🔍 Processing: Paris, France
+   Location: Paris,France, Timezone: Europe/Paris
+   ❌ Day -1: VC fetch error: API returned status 429: Maximum daily cost exceeded
+   ❌ Day -2: VC fetch error: API returned status 429: Maximum daily cost exceeded
+   ❌ Day -3: VC fetch error: API returned status 429: Maximum daily cost exceeded
+   ❌ Day -4: VC fetch error: API returned status 429: Maximum daily cost exceeded
+   ❌ Day -5: VC fetch error: API returned status 429: Maximum daily cost exceeded
+   ❌ Day -6: VC fetch error: API returned status 429: Maximum daily cost exceeded
+   ❌ Day -7: VC fetch error: API returned status 429: Maximum daily cost exceeded
+   ✅ Complete: 0 success, 365 failed
+   ⚠️  Failed to update stats: no data found for city: Paris
+
+🔍 Processing: Toronto, Canada
+   Location: Toronto,Canada, Timezone: America/Toronto
+   ❌ Day -1: VC fetch error: API returned status 429: Maximum daily cost exceeded
+   ❌ Day -2: VC fetch error: API returned status 429: Maximum daily cost exceeded
+   ❌ Day -3: VC fetch error: API returned status 429: Maximum daily cost exceeded
+   ❌ Day -4: VC fetch error: API returned status 429: Maximum daily cost exceeded
+   ❌ Day -5: VC fetch error: API returned status 429: Maximum daily cost exceeded
+   ❌ Day -6: VC fetch error: API returned status 429: Maximum daily cost exceeded
+   ❌ Day -7: VC fetch error: API returned status 429: Maximum daily cost exceeded
+   ✅ Complete: 0 success, 365 failed
+   ⚠️  Failed to update stats: no data found for city: Toronto
+
+🔍 Processing: Seoul, South Korea
+   Location: Seoul,South Korea, Timezone: Asia/Seoul
+   ❌ Day -1: VC fetch error: API returned status 429: Maximum daily cost exceeded
+   ❌ Day -2: VC fetch error: API returned status 429: Maximum daily cost exceeded
+   ❌ Day -3: VC fetch error: API returned status 429: Maximum daily cost exceeded
+   ❌ Day -4: VC fetch error: API returned status 429: Maximum daily cost exceeded
+   ❌ Day -5: VC fetch error: API returned status 429: Maximum daily cost exceeded
+   ❌ Day -6: VC fetch error: API returned status 429: Maximum daily cost exceeded
+   ❌ Day -7: VC fetch error: API returned status 429: Maximum daily cost exceeded
+   ✅ Complete: 0 success, 365 failed
+   ⚠️  Failed to update stats: no data found for city: Seoul
+
+🔍 Processing: Buenos Aires, Argentina
+   Location: Buenos Aires,Argentina, Timezone: America/Argentina/Buenos_Aires
+   ❌ Day -1: VC fetch error: API returned status 429: Maximum daily cost exceeded
+   ❌ Day -2: VC fetch error: API returned status 429: Maximum daily cost exceeded
+   ❌ Day -3: VC fetch error: API returned status 429: Maximum daily cost exceeded
+   ❌ Day -4: VC fetch error: API returned status 429: Maximum daily cost exceeded
+   ❌ Day -5: VC fetch error: API returned status 429: Maximum daily cost exceeded
+   ❌ Day -6: VC fetch error: API returned status 429: Maximum daily cost exceeded
+   ❌ Day -7: VC fetch error: API returned status 429: Maximum daily cost exceeded
+   ✅ Complete: 0 success, 365 failed
+   ⚠️  Failed to update stats: no data found for city: Buenos Aires
+
+🔍 Processing: Ankara, Turkey
+   Location: Ankara,Turkey, Timezone: Europe/Istanbul
+   ❌ Day -1: VC fetch error: API returned status 429: Maximum daily cost exceeded
+   ❌ Day -2: VC fetch error: API returned status 429: Maximum daily cost exceeded
+   ❌ Day -3: VC fetch error: API returned status 429: Maximum daily cost exceeded
+   ❌ Day -4: VC fetch error: API returned status 429: Maximum daily cost exceeded
+   ❌ Day -5: VC fetch error: API returned status 429: Maximum daily cost exceeded
+   ❌ Day -6: VC fetch error: API returned status 429: Maximum daily cost exceeded
+   ❌ Day -7: VC fetch error: API returned status 429: Maximum daily cost exceeded
+   ✅ Complete: 0 success, 365 failed
+   ⚠️  Failed to update stats: no data found for city: Ankara
+
+🔍 Processing: Sao Paulo, Brazil
+   Location: Sao Paulo,Brazil, Timezone: America/Sao_Paulo
+   ❌ Day -1: VC fetch error: API returned status 429: Maximum daily cost exceeded
+   ❌ Day -2: VC fetch error: API returned status 429: Maximum daily cost exceeded
+   ❌ Day -3: VC fetch error: API returned status 429: Maximum daily cost exceeded
+   ❌ Day -4: VC fetch error: API returned status 429: Maximum daily cost exceeded
+   ❌ Day -5: VC fetch error: API returned status 429: Maximum daily cost exceeded
+   ❌ Day -6: VC fetch error: API returned status 429: Maximum daily cost exceeded
+   ❌ Day -7: VC fetch error: API returned status 429: Maximum daily cost exceeded
+   ✅ Complete: 0 success, 365 failed
+   ⚠️  Failed to update stats: no data found for city: Sao Paulo
+
+🔍 Processing: Wellington, New Zealand
+   Location: Wellington,New Zealand, Timezone: Pacific/Auckland
+   ❌ Day -1: VC fetch error: API returned status 429: Maximum daily cost exceeded
+   ❌ Day -2: VC fetch error: API returned status 429: Maximum daily cost exceeded
+   ❌ Day -3: VC fetch error: API returned status 429: Maximum daily cost exceeded
+   ❌ Day -4: VC fetch error: API returned status 429: Maximum daily cost exceeded
+   ❌ Day -5: VC fetch error: API returned status 429: Maximum daily cost exceeded
+   ❌ Day -6: VC fetch error: API returned status 429: Maximum daily cost exceeded
+   ❌ Day -7: VC fetch error: API returned status 429: Maximum daily cost exceeded
+   ✅ Complete: 0 success, 365 failed
+   ⚠️  Failed to update stats: no data found for city: Wellington
+
+=== BACKFILL COMPLETE ===
+Total records processed: 33
+Success: 33 (100.0%)
+Failed: 2887 (8748.5%)
+
+=== CITY STATISTICS ===
+
+📍 London (Europe/London)
+   Data points: 33
+   Avg high temp time: 13:07
+   Avg WU data final: 23:00
+   Avg market resolution: 23:30
+   ⭐ OPTIMAL ENTRY TIME: 23:30
+   Confidence: 73.2%
+
+✅ Backfill complete! Database ready for international markets.
+📝 Next step: Update bot to use optimal entry times from database

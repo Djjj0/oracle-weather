@@ -40,6 +40,7 @@ type Config struct {
 	// Bot Settings
 	MinProfitThreshold float64
 	MaxPositionSize    float64
+	PositionSizePct    float64 // Fraction of live balance to use per trade (e.g. 0.05 = 5%)
 	CheckInterval      int
 	LogLevel           string
 	DatabasePath       string
@@ -63,6 +64,9 @@ type Config struct {
 	ParityMinLiquidity          float64
 	ParityMinVolume24h          float64
 	ParityMaxConcurrentPositions int
+
+	// Rain market settings
+	RainMaxPosition float64 // Hard cap for rain market positions (testing)
 
 	// Notifications
 	DiscordWebhookURL string
@@ -102,8 +106,9 @@ func LoadConfig() (*Config, error) {
 		CoinGeckoBaseURL: getEnvOrDefault("COINGECKO_BASE_URL", "https://api.coingecko.com/api/v3"),
 
 		// Bot Settings
-		MinProfitThreshold: getEnvAsFloat("MIN_PROFIT_THRESHOLD", 0.05),
+		MinProfitThreshold: getEnvAsFloat("MIN_PROFIT_THRESHOLD", 0.03),
 		MaxPositionSize:    getEnvAsFloat("MAX_POSITION_SIZE", 100.0),
+		PositionSizePct:    getEnvAsFloat("POSITION_SIZE_PCT", 0.05),
 		CheckInterval:      getEnvAsInt("CHECK_INTERVAL_SECONDS", 60),
 		LogLevel:           getEnvOrDefault("LOG_LEVEL", "info"),
 		DatabasePath:       getEnvOrDefault("DATABASE_PATH", "./data/trades.db"),
@@ -127,6 +132,9 @@ func LoadConfig() (*Config, error) {
 		ParityMinLiquidity:           getEnvAsFloat("PARITY_MIN_LIQUIDITY", 500.0),
 		ParityMinVolume24h:           getEnvAsFloat("PARITY_MIN_VOLUME_24H", 100.0),
 		ParityMaxConcurrentPositions: getEnvAsInt("PARITY_MAX_CONCURRENT_POSITIONS", 5),
+
+		// Rain market settings
+		RainMaxPosition: getEnvAsFloat("RAIN_MAX_POSITION", 1.0),
 
 		// Notifications
 		DiscordWebhookURL: os.Getenv("DISCORD_WEBHOOK_URL"),
