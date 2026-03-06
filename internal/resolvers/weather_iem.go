@@ -42,7 +42,7 @@ func NewIEMWeatherResolver(cfg *config.Config) *IEMWeatherResolver {
 // cityToAirport maps cities to their ICAO airport codes (Wunderground uses these)
 var cityToAirport = map[string]string{
 	"seattle":        "KSEA",
-	"new york":       "KJFK",
+	"new york":       "KLGA", // LaGuardia — Polymarket uses KLGA not KJFK
 	"los angeles":    "KLAX",
 	"chicago":        "KORD",
 	"houston":        "KIAH",
@@ -58,7 +58,7 @@ var cityToAirport = map[string]string{
 	"denver":         "KDEN",
 	"washington":     "KDCA",
 	"nashville":      "KBNA",
-	"london":         "EGLL", // Heathrow
+	"london":         "EGLC", // London City Airport — Polymarket uses EGLC not EGLL
 	"paris":          "LFPG", // Charles de Gaulle
 	"tokyo":          "RJTT", // Haneda
 	"las vegas":      "KLAS",
@@ -103,6 +103,10 @@ var cityToAirport = map[string]string{
 	"zurich":         "LSZH",
 	"milan":          "LIMC",
 	"munich":         "EDDM",
+	"lucknow":        "VILK", // Chaudhary Charan Singh Intl
+	"ankara":         "LTAC", // Esenboğa Intl
+	"sao paulo":      "SBGR", // Guarulhos Intl
+	"wellington":     "NZWN", // Wellington Intl
 }
 
 // CheckResolution checks weather using IEM ASOS data.
