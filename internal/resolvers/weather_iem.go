@@ -304,28 +304,20 @@ func (w *IEMWeatherResolver) determineOutcomeWithPeak(data *MarketData, runningH
 		}
 		if pastPeak {
 			margin := data.Threshold - runningHigh
+			// Require at least 1 degree below ceiling before betting YES.
+			// If running high == threshold, it's right at the boundary — too
+			// risky (any warmer observation would exceed it). Skip.
+			if margin < 1.0 {
+				return "", 0
+			}
 			peakMarginBonus := math.Min((currentHour-typicalPeakHour-1.0)*0.05, 0.10)
 			return "Yes", math.Min(marginToConfidence(margin)+peakMarginBonus, 0.98)
 		}
 
 	case "temperature_exact":
-		if roundedHigh == data.Threshold {
-			if pastPeak {
-				// On the number and past peak — high confidence YES
-				margin := 0.5 - math.Abs(runningHigh-data.Threshold)
-				if margin < 0 {
-					margin = 0
-				}
-				return "Yes", marginToConfidence(margin)
-			}
-			// On the number but not past peak — could still go higher, wait
-			return "", 0
-		}
-		if pastPeak {
-			// Past peak and not on target number — bet NO
-			margin := math.Abs(runningHigh - data.Threshold)
-			return "No", marginToConfidence(margin)
-		}
+		// Exact-degree markets are too unpredictable — the high must land on
+		// a single integer. Skip entirely to avoid low-quality bets.
+		return "", 0
 
 	case "temperature_range":
 		tempLow := data.Extra["temp_low"].(float64)

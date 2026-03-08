@@ -506,7 +506,29 @@ func (s *OracleLagStrategy) ExecuteOpportunity(ctx context.Context, opp Opportun
 		return fmt.Errorf("circuit breaker tripped: %s", reason)
 	}
 
-	// Check for duplicate / re-entry
+	// Check DB for existing open position on this market — survives restarts.
+	// Skip if we already hold a position at a similar or worse price.
+	// Allow re-entry only if current price is >10% better than our entry
+	// (e.g. we bought NO at 80¢, now it's at 65¢ — materially better entry).
+	const minPriceImprovementForReEntry = 0.10
+	existingPositions, dbErr := database.GetPositionsByMarket(s.db, opp.MarketID)
+	if dbErr == nil {
+		for _, p := range existingPositions {
+			if strings.EqualFold(p.Outcome, opp.Outcome) && p.Status == "OPEN" {
+				priceImprovement := p.EntryPrice - opp.CurrentPrice
+				if priceImprovement < minPriceImprovementForReEntry {
+					utils.Logger.Infof("⏭️  Skipping - already have open position for %s %s at $%.2f, current $%.2f (improvement %.2f < %.0f%%)",
+						opp.MarketQuestion, opp.Outcome, p.EntryPrice, opp.CurrentPrice,
+						priceImprovement, minPriceImprovementForReEntry*100)
+					return nil
+				}
+				utils.Logger.Infof("📈 Price improved %.0f%% since entry ($%.2f → $%.2f), adding to position",
+					priceImprovement*100, p.EntryPrice, opp.CurrentPrice)
+			}
+		}
+	}
+
+	// In-memory check for duplicate / re-entry within this session
 	tradeStatus := s.executedTrades.CheckTradeStatus(opp.MarketID, opp.Outcome)
 	isReEntry := false
 	switch tradeStatus {
