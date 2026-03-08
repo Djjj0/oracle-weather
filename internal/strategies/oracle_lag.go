@@ -581,16 +581,17 @@ func (s *OracleLagStrategy) ExecuteOpportunity(ctx context.Context, opp Opportun
 		utils.Logger.Infof("🔄 Re-entry position size: $%.2f (50%% of normal)", positionSize)
 	}
 
-	// Polymarket requires minimum 5 shares per order.
-	// Ensure positionSize covers at least 5 shares at the current price.
-	minSizeForShares := 5.0 * opp.CurrentPrice
-	if positionSize < minSizeForShares {
-		positionSize = minSizeForShares
-		utils.Logger.Infof("Position size bumped to $%.2f to meet 5-share minimum at price $%.2f", positionSize, opp.CurrentPrice)
+	// Polymarket SDK expects size in number of shares (not USDC).
+	// Convert USDC positionSize to shares, then enforce the 5-share minimum.
+	sharesAmount := positionSize / opp.CurrentPrice
+	if sharesAmount < 5.0 {
+		sharesAmount = 5.0
+		positionSize = sharesAmount * opp.CurrentPrice // keep in sync for logging/DB
+		utils.Logger.Infof("Shares bumped to 5.0 to meet minimum (cost: $%.2f at price $%.2f)", positionSize, opp.CurrentPrice)
 	}
 
-	utils.Logger.Infof("Position size: $%.2f (%.0f%% of max due to %.1f%% confidence, %.1f%% edge)",
-		positionSize, (positionSize/s.config.MaxPositionSize)*100, opp.Confidence*100, opp.Edge*100)
+	utils.Logger.Infof("Position size: $%.2f / %.2f shares (%.0f%% of max due to %.1f%% confidence, %.1f%% edge)",
+		positionSize, sharesAmount, (positionSize/s.config.MaxPositionSize)*100, opp.Confidence*100, opp.Edge*100)
 
 	// PHASE 7: Check gas price profitability
 	shouldExecute, reason := s.client.ShouldExecuteTrade(opp.ExpectedProfit, positionSize)
@@ -603,7 +604,7 @@ func (s *OracleLagStrategy) ExecuteOpportunity(ctx context.Context, opp Opportun
 	maxRetries := 3
 	var orderErr error
 	for attempt := 1; attempt <= maxRetries; attempt++ {
-		orderErr = s.client.PlaceMarketOrder(opp.TokenID, opp.CurrentPrice, positionSize)
+		orderErr = s.client.PlaceMarketOrder(opp.TokenID, opp.CurrentPrice, sharesAmount)
 		if orderErr == nil {
 			// Success!
 			break
@@ -902,7 +903,26 @@ func (s *OracleLagStrategy) CheckAndClaimPositions(ctx context.Context) (*Redemp
 			pos.MarketQuestion, market.Outcomes, market.Prices, pos.Outcome, won)
 
 		if won {
-			// WIN - our outcome was correct
+			// WIN — redeem on-chain first so USDC lands in the wallet
+			if pos.TokenID != "" {
+				redeemResp, redeemErr := polymarket.RedeemPositionViaPython(ctx, pos.TokenID, pos.Outcome)
+				if redeemErr != nil {
+					utils.Logger.Errorf("On-chain redemption failed for position #%d (%s): %v — will retry next cycle",
+						pos.ID, pos.MarketQuestion, redeemErr)
+					result.Pending++
+					continue
+				}
+				if !redeemResp.Success {
+					utils.Logger.Errorf("On-chain redemption rejected for position #%d (%s): %s — will retry next cycle",
+						pos.ID, pos.MarketQuestion, redeemResp.Error)
+					result.Pending++
+					continue
+				}
+			} else {
+				utils.Logger.Warnf("No TokenID for position #%d (%s) — skipping on-chain redemption, recording win only",
+					pos.ID, pos.MarketQuestion)
+			}
+
 			if err := database.ClaimPosition(s.db, pos.ID, 1.0); err != nil {
 				utils.Logger.Errorf("Failed to claim position #%d: %v", pos.ID, err)
 				continue

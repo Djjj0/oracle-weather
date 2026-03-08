@@ -55,14 +55,40 @@ func (f *Factory) GetResolver(marketCategory string) Resolver {
 	}
 }
 
+// containsWord checks if a question contains a keyword as a whole word (not a substring).
+// e.g. "rain" matches "will it rain" but NOT "rainbow".
+func containsWord(question, keyword string) bool {
+	idx := strings.Index(question, keyword)
+	if idx < 0 {
+		return false
+	}
+	// Check char before keyword
+	if idx > 0 {
+		c := question[idx-1]
+		if (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') {
+			return false
+		}
+	}
+	// Check char after keyword
+	end := idx + len(keyword)
+	if end < len(question) {
+		c := question[end]
+		if (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') {
+			return false
+		}
+	}
+	return true
+}
+
 // GetResolverByQuestion auto-detects category from the question text
 func (f *Factory) GetResolverByQuestion(question string) Resolver {
 	question = strings.ToLower(question)
 
-	// Weather keywords
+	// Weather keywords — use word-boundary check to avoid false positives
+	// e.g. "rain" in "Rainbow" or "snow" in "Snowflake"
 	weatherKeywords := []string{"rain", "temperature", "snow", "weather", "sunny", "cloudy"}
 	for _, keyword := range weatherKeywords {
-		if strings.Contains(question, keyword) {
+		if containsWord(question, keyword) {
 			return NewIEMWeatherResolverWithDBs(f.config, f.learningDB, f.intlDB)
 		}
 	}

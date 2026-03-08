@@ -358,7 +358,7 @@ func (c *PolymarketClientLixv) GetBalance() (float64, error) {
 	// TODO: Implement live balance checking via Polymarket API
 	// For now, return user's reported balance
 	// Bot will fail gracefully if insufficient funds
-	return 21.0, nil
+	return 112.0, nil
 }
 
 // GetActiveMarkets retrieves all active markets
