@@ -94,6 +94,10 @@ var cityTimezones = map[string]string{
 	"london":       "Europe/London",
 	"paris":        "Europe/Paris",
 	"tokyo":        "Asia/Tokyo",
+	"lucknow":      "Asia/Kolkata",
+	"ankara":       "Europe/Istanbul",
+	"sao paulo":    "America/Sao_Paulo",
+	"wellington":   "Pacific/Auckland",
 }
 
 // getTimezone returns the IANA timezone string for a city
