@@ -212,9 +212,17 @@ func (w *IEMWeatherResolver) CheckResolution(market polymarket.Market) (*string,
 	}
 
 	// Fetch the current running high from IEM (max of all observations so far today)
-	runningHigh, err := w.getIEMHighTemp(airportCode, data.Date, useCelsius)
+	runningHigh, obsCount, err := w.getIEMHighTemp(airportCode, data.Date, useCelsius)
 	if err != nil {
 		return nil, 0, fmt.Errorf("IEM API error: %w", err)
+	}
+
+	// Require at least 4 observations (≈4 hours of today's data) before trusting
+	// the running high for a YES bet. Early morning queries (e.g. 7am local) may
+	// only have 1-2 readings which could be stale overnight data.
+	const minObsForYes = 4
+	if obsCount < minObsForYes {
+		return nil, 0, fmt.Errorf("data not yet available (only %d observations so far today, need %d)", obsCount, minObsForYes)
 	}
 
 	now := time.Now().In(loc)
@@ -347,7 +355,7 @@ func (w *IEMWeatherResolver) determineOutcomeWithPeak(data *MarketData, runningH
 }
 
 // getIEMHighTemp fetches daily high temperature from IEM ASOS API
-func (w *IEMWeatherResolver) getIEMHighTemp(station string, date time.Time, celsius bool) (float64, error) {
+func (w *IEMWeatherResolver) getIEMHighTemp(station string, date time.Time, celsius bool) (float64, int, error) {
 	// IEM ASOS API endpoint
 	url := fmt.Sprintf(
 		"https://mesonet.agron.iastate.edu/cgi-bin/request/asos.py?station=%s&data=tmpf&year1=%d&month1=%d&day1=%d&year2=%d&month2=%d&day2=%d&tz=UTC&format=onlycomma&latlon=no&elev=no&missing=null&trace=null&direct=no&report_type=3&report_type=4",
@@ -358,17 +366,17 @@ func (w *IEMWeatherResolver) getIEMHighTemp(station string, date time.Time, cels
 
 	resp, err := w.client.R().Get(url)
 	if err != nil {
-		return 0, fmt.Errorf("failed to fetch IEM data: %w", err)
+		return 0, 0, fmt.Errorf("failed to fetch IEM data: %w", err)
 	}
 
 	if resp.IsError() {
-		return 0, fmt.Errorf("IEM API returned error: %s", resp.Status())
+		return 0, 0, fmt.Errorf("IEM API returned error: %s", resp.Status())
 	}
 
 	// Parse CSV response
 	lines := strings.Split(strings.TrimSpace(resp.String()), "\n")
 	if len(lines) < 2 {
-		return 0, fmt.Errorf("no data returned from IEM for station %s on %s", station, date.Format("2006-01-02"))
+		return 0, 0, fmt.Errorf("no data returned from IEM for station %s on %s", station, date.Format("2006-01-02"))
 	}
 
 	// Extract temperatures from CSV (skip header)
@@ -397,7 +405,7 @@ func (w *IEMWeatherResolver) getIEMHighTemp(station string, date time.Time, cels
 	}
 
 	if len(temps) == 0 {
-		return 0, fmt.Errorf("no valid temperature readings for %s on %s", station, date.Format("2006-01-02"))
+		return 0, 0, fmt.Errorf("no valid temperature readings for %s on %s", station, date.Format("2006-01-02"))
 	}
 
 	// Get daily high (max temperature)
@@ -413,7 +421,7 @@ func (w *IEMWeatherResolver) getIEMHighTemp(station string, date time.Time, cels
 		highTemp = (highTemp - 32) * 5 / 9
 	}
 
-	return highTemp, nil
+	return highTemp, len(temps), nil
 }
 
 // marginToConfidence converts degrees of margin from a threshold to a confidence value.
