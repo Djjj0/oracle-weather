@@ -208,8 +208,8 @@ func (w *WeatherResolver) ParseMarketQuestion(question string) (*MarketData, err
 		return data, nil
 	}
 
-	// Pattern 3: "Will the highest temperature in [city] be [X]°F or lower on [date]?"
-	tempLowerPattern := regexp.MustCompile(`(?i)will the highest temperature in ([a-z\s]+?) be (\d+)°?f or lower on ([a-z]+\s+\d+)`)
+	// Pattern 3: "Will the highest temperature in [city] be [X]°F or lower/below on [date]?"
+	tempLowerPattern := regexp.MustCompile(`(?i)will the highest temperature in ([a-z\s]+?) be (\d+)°?f or (?:lower|below) on ([a-z]+\s+\d+)`)
 	if matches := tempLowerPattern.FindStringSubmatch(question); len(matches) > 3 {
 		data.Location = strings.TrimSpace(matches[1])
 		data.Condition = "temperature_below"

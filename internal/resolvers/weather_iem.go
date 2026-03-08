@@ -26,10 +26,12 @@ type IEMWeatherResolver struct {
 }
 
 // NewIEMWeatherResolver creates a new IEM weather resolver
+// NewIEMWeatherResolver creates a resolver, opening the learning DBs itself.
+// Prefer NewIEMWeatherResolverWithDBs when DBs are already open (avoids SQLITE_BUSY).
 func NewIEMWeatherResolver(cfg *config.Config) *IEMWeatherResolver {
 	learningDB, err := pkgweather.NewLearningDB("./data/learning.db")
 	if err != nil {
-		utils.Logger.Warnf("IEM resolver: could not open learning DB (peak times will use defaults): %v", err)
+		utils.Logger.Warnf("Failed to open learning database: %v - will use fallback timing", err)
 		learningDB = nil
 	}
 	intlDB, err := pkgweather.NewLearningDB("./data/learning_international.db")
@@ -37,6 +39,12 @@ func NewIEMWeatherResolver(cfg *config.Config) *IEMWeatherResolver {
 		utils.Logger.Warnf("IEM resolver: could not open international learning DB: %v", err)
 		intlDB = nil
 	}
+	return NewIEMWeatherResolverWithDBs(cfg, learningDB, intlDB)
+}
+
+// NewIEMWeatherResolverWithDBs creates a resolver using pre-opened learning DBs.
+// Use this to share a single DB connection across all resolver instances.
+func NewIEMWeatherResolverWithDBs(cfg *config.Config, learningDB, intlDB *pkgweather.LearningDB) *IEMWeatherResolver {
 	return &IEMWeatherResolver{
 		config:     cfg,
 		client:     resty.New().SetTimeout(15 * time.Second),
@@ -423,81 +431,6 @@ func marginToConfidence(marginDegrees float64) float64 {
 	default:
 		// Very close to boundary — rounding or station variance could flip the result
 		return 0.70
-	}
-}
-
-// determineOutcome determines market outcome and confidence based on temperature.
-// Confidence reflects how far the actual temp is from the decision boundary —
-// e.g. 75°F on "above 50°F" is 0.98, but 50.2°F on the same market is 0.70.
-func (w *IEMWeatherResolver) determineOutcome(data *MarketData, temp float64, unitSymbol string) (string, float64) {
-	roundedTemp := math.Round(temp)
-
-	switch data.Condition {
-	case "temperature_exact":
-		// Margin = how far from the rounding boundary (max 0.5 when exactly on threshold)
-		margin := 0.5 - math.Abs(temp-data.Threshold)
-		if margin < 0 {
-			margin = 0
-		}
-		confidence := marginToConfidence(margin)
-		if roundedTemp == data.Threshold {
-			utils.Logger.Infof("IEM Weather resolved: %s high=%.1f%s, expected=%.0f%s → Yes (confidence: %.0f%%, margin: %.1f°)",
-				data.Location, temp, unitSymbol, data.Threshold, unitSymbol, confidence*100, margin)
-			return "Yes", confidence
-		}
-		utils.Logger.Infof("IEM Weather resolved: %s high=%.1f%s, expected=%.0f%s → No (confidence: %.0f%%, margin: %.1f°)",
-			data.Location, temp, unitSymbol, data.Threshold, unitSymbol, confidence*100, margin)
-		return "No", confidence
-
-	case "temperature_range":
-		tempLow := data.Extra["temp_low"].(float64)
-		tempHigh := data.Extra["temp_high"].(float64)
-		if roundedTemp >= tempLow && roundedTemp <= tempHigh {
-			// Margin = distance from nearest edge of the range
-			margin := math.Min(temp-tempLow, tempHigh-temp)
-			confidence := marginToConfidence(margin)
-			utils.Logger.Infof("IEM Weather resolved: %s high=%.1f%s, range=%.0f-%.0f%s → Yes (confidence: %.0f%%, margin: %.1f°)",
-				data.Location, temp, unitSymbol, tempLow, tempHigh, unitSymbol, confidence*100, margin)
-			return "Yes", confidence
-		}
-		// Outside range — margin = distance from nearest edge
-		var margin float64
-		if temp < tempLow {
-			margin = tempLow - temp
-		} else {
-			margin = temp - tempHigh
-		}
-		confidence := marginToConfidence(margin)
-		utils.Logger.Infof("IEM Weather resolved: %s high=%.1f%s, range=%.0f-%.0f%s → No (confidence: %.0f%%, margin: %.1f°)",
-			data.Location, temp, unitSymbol, tempLow, tempHigh, unitSymbol, confidence*100, margin)
-		return "No", confidence
-
-	case "temperature_above":
-		if roundedTemp >= data.Threshold {
-			margin := temp - data.Threshold
-			confidence := marginToConfidence(margin)
-			utils.Logger.Infof("IEM Weather resolved: %s high=%.1f%s ≥ %.0f%s → Yes (confidence: %.0f%%, margin: %.1f°)",
-				data.Location, temp, unitSymbol, data.Threshold, unitSymbol, confidence*100, margin)
-			return "Yes", confidence
-		}
-		margin := data.Threshold - temp
-		confidence := marginToConfidence(margin)
-		utils.Logger.Infof("IEM Weather resolved: %s high=%.1f%s < %.0f%s → No (confidence: %.0f%%, margin: %.1f°)",
-			data.Location, temp, unitSymbol, data.Threshold, unitSymbol, confidence*100, margin)
-		return "No", confidence
-
-	case "temperature_below":
-		if roundedTemp <= data.Threshold {
-			margin := data.Threshold - temp
-			confidence := marginToConfidence(margin)
-			return "Yes", confidence
-		}
-		margin := temp - data.Threshold
-		confidence := marginToConfidence(margin)
-		return "No", confidence
-
-	default:
-		return "No", 0.50
 	}
 }
 

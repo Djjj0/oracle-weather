@@ -4,17 +4,33 @@ import (
 	"strings"
 
 	"github.com/djbro/oracle-weather/internal/config"
+	pkgweather "github.com/djbro/oracle-weather/pkg/weather"
+	"github.com/djbro/oracle-weather/pkg/utils"
 )
 
-// Factory creates appropriate resolvers based on market category
+// Factory creates appropriate resolvers based on market category.
+// The learning DBs are opened once and shared across all IEM resolver instances
+// to avoid SQLITE_BUSY errors from concurrent opens.
 type Factory struct {
-	config *config.Config
+	config     *config.Config
+	learningDB *pkgweather.LearningDB
+	intlDB     *pkgweather.LearningDB
 }
 
-// NewFactory creates a new resolver factory
+// NewFactory creates a new resolver factory, opening the learning DBs once.
 func NewFactory(cfg *config.Config) *Factory {
+	learningDB, err := pkgweather.NewLearningDB("./data/learning.db")
+	if err != nil {
+		utils.Logger.Warnf("Factory: could not open learning DB (peak times will use defaults): %v", err)
+	}
+	intlDB, err := pkgweather.NewLearningDB("./data/learning_international.db")
+	if err != nil {
+		utils.Logger.Warnf("Factory: could not open international learning DB: %v", err)
+	}
 	return &Factory{
-		config: cfg,
+		config:     cfg,
+		learningDB: learningDB,
+		intlDB:     intlDB,
 	}
 }
 
@@ -24,7 +40,9 @@ func (f *Factory) GetResolver(marketCategory string) Resolver {
 
 	switch category {
 	case "weather":
-		return NewIEMWeatherResolver(f.config)
+		// Don't trust the category tag alone — Polymarket sometimes tags non-weather
+		// markets as "weather". Let caller fall through to GetResolverByQuestion.
+		return nil
 	case "crypto", "cryptocurrency":
 		return NewCryptoResolver(f.config)
 	case "sports":
@@ -45,7 +63,7 @@ func (f *Factory) GetResolverByQuestion(question string) Resolver {
 	weatherKeywords := []string{"rain", "temperature", "snow", "weather", "sunny", "cloudy"}
 	for _, keyword := range weatherKeywords {
 		if strings.Contains(question, keyword) {
-			return NewIEMWeatherResolver(f.config)
+			return NewIEMWeatherResolverWithDBs(f.config, f.learningDB, f.intlDB)
 		}
 	}
 
@@ -92,7 +110,7 @@ func (f *Factory) GetResolverByQuestion(question string) Resolver {
 func (f *Factory) autoDetectResolver(category string) Resolver {
 	// Check for weather-related categories
 	if strings.Contains(category, "weather") || strings.Contains(category, "climate") {
-		return NewIEMWeatherResolver(f.config)
+		return NewIEMWeatherResolverWithDBs(f.config, f.learningDB, f.intlDB)
 	}
 
 	// Check for crypto-related categories
@@ -113,6 +131,11 @@ func (f *Factory) autoDetectResolver(category string) Resolver {
 	}
 
 	return nil
+}
+
+// GetIEMResolver returns a shared IEM weather resolver using the factory's open DBs.
+func (f *Factory) GetIEMResolver() *IEMWeatherResolver {
+	return NewIEMWeatherResolverWithDBs(f.config, f.learningDB, f.intlDB)
 }
 
 // GetAllResolvers returns all available resolvers

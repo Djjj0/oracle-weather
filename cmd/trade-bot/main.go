@@ -131,12 +131,16 @@ func runPositionClaimer(ctx context.Context, strategy *strategies.OracleLagStrat
 	ticker := time.NewTicker(5 * time.Minute)
 	defer ticker.Stop()
 
-	// Run immediately on start
-	if result, err := strategy.CheckAndClaimPositions(ctx); err != nil && ctx.Err() == nil {
-		logger.Errorf("Position claimer error: %v", err)
-	} else if result != nil && (result.Wins > 0 || result.Losses > 0) {
-		logger.Infof("Position claim cycle: %d wins, %d losses, P&L: $%.2f", result.Wins, result.Losses, result.TotalProfit)
+	runCycle := func() {
+		if result, err := strategy.CheckAndClaimPositions(ctx); err != nil && ctx.Err() == nil {
+			logger.Errorf("Position claimer error: %v", err)
+		} else if result != nil && (result.Wins > 0 || result.Losses > 0) {
+			logger.Infof("Position claim cycle: %d wins, %d losses, P&L: $%.2f", result.Wins, result.Losses, result.TotalProfit)
+		}
 	}
+
+	// Run immediately on start
+	runCycle()
 
 	for {
 		select {
@@ -144,11 +148,7 @@ func runPositionClaimer(ctx context.Context, strategy *strategies.OracleLagStrat
 			logger.Info("Position claimer stopped")
 			return
 		case <-ticker.C:
-			if result, err := strategy.CheckAndClaimPositions(ctx); err != nil && ctx.Err() == nil {
-				logger.Errorf("Position claimer error: %v", err)
-			} else if result != nil && (result.Wins > 0 || result.Losses > 0) {
-				logger.Infof("Position claim cycle: %d wins, %d losses, P&L: $%.2f", result.Wins, result.Losses, result.TotalProfit)
-			}
+			runCycle()
 		}
 	}
 }

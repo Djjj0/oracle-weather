@@ -7,6 +7,7 @@ import (
 
 	"github.com/djbro/oracle-weather/internal/config"
 	"github.com/djbro/oracle-weather/internal/database"
+	"github.com/djbro/oracle-weather/internal/resolvers"
 	"github.com/djbro/oracle-weather/pkg/polymarket"
 	"github.com/djbro/oracle-weather/pkg/utils"
 	bolt "go.etcd.io/bbolt"
@@ -171,4 +172,114 @@ func (pc *PositionCloser) getCurrentPrice(market polymarket.Market, outcome stri
 		}
 	}
 	return 0
+}
+
+// ValidateAndExitBadPositions checks every open position against the IEM resolver.
+// If the resolver now disagrees with the held outcome (or says it's too early to know),
+// the position is sold immediately at the best available price.
+// This catches positions placed by old/buggy code before peak-hour gating was enforced.
+func (pc *PositionCloser) ValidateAndExitBadPositions(ctx context.Context) error {
+	utils.Logger.Info("🔎 Validating open positions against IEM resolver...")
+
+	positions, err := database.GetOpenPositions(pc.db)
+	if err != nil {
+		return fmt.Errorf("failed to get open positions: %w", err)
+	}
+	if len(positions) == 0 {
+		utils.Logger.Info("No open positions to validate")
+		return nil
+	}
+
+	resolver := resolvers.NewIEMWeatherResolver(pc.config)
+	exited := 0
+
+	for _, pos := range positions {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+
+		// Fetch fresh market data
+		market, err := pc.client.GetMarketByID(pos.MarketID)
+		if err != nil {
+			utils.Logger.Warnf("ValidatePositions: cannot fetch market %s: %v", pos.MarketID, err)
+			continue
+		}
+		if market.Closed {
+			utils.Logger.Infof("✅ Market already closed, skipping validation: %s", pos.MarketQuestion)
+			continue
+		}
+
+		// Ask the IEM resolver what it thinks RIGHT NOW
+		outcome, confidence, err := resolver.CheckResolution(*market)
+		if err != nil {
+			utils.Logger.Warnf("ValidatePositions: resolver error for %q: %v — keeping position", pos.MarketQuestion, err)
+			continue
+		}
+
+		var exitReason string
+		shouldExit := false
+
+		if outcome == nil {
+			// Resolver says it's too early to know (pre-peak) — position was placed prematurely
+			exitReason = "placed before peak hour — resolver cannot confirm outcome yet"
+			shouldExit = true
+		} else if *outcome != pos.Outcome {
+			// Resolver now disagrees with our position
+			exitReason = fmt.Sprintf("resolver now says %s (we hold %s, confidence=%.0f%%)", *outcome, pos.Outcome, confidence*100)
+			shouldExit = true
+		}
+
+		if !shouldExit {
+			utils.Logger.Infof("✅ Position valid: %q → %s confirmed by resolver", pos.MarketQuestion, pos.Outcome)
+			continue
+		}
+
+		utils.Logger.Warnf("⚠️  BAD POSITION DETECTED: %q (held=%s) — %s", pos.MarketQuestion, pos.Outcome, exitReason)
+
+		// Sell at current market price
+		currentPrice := pc.getCurrentPrice(*market, pos.Outcome)
+		if currentPrice <= 0 {
+			utils.Logger.Warnf("Cannot exit %q — no valid sell price available", pos.MarketQuestion)
+			continue
+		}
+		if pos.TokenID == "" {
+			utils.Logger.Warnf("Cannot exit %q — no TokenID stored", pos.MarketQuestion)
+			continue
+		}
+
+		shares := pos.PositionSize / pos.EntryPrice
+		sellAmount := shares * currentPrice
+		if err := pc.client.PlaceSellOrder(pos.TokenID, currentPrice, sellAmount); err != nil {
+			utils.Logger.Errorf("Failed to exit bad position %q: %v", pos.MarketQuestion, err)
+			continue
+		}
+
+		profit := sellAmount - pos.PositionSize
+		utils.Logger.Infof("🚪 Exited bad position: %q | entry=$%.2f exit=$%.2f | P&L=$%.2f",
+			pos.MarketQuestion, pos.EntryPrice, currentPrice, profit)
+
+		// Record closure
+		trade := database.Trade{
+			MarketID:       pos.MarketID,
+			MarketQuestion: pos.MarketQuestion,
+			Outcome:        pos.Outcome,
+			EntryPrice:     pos.EntryPrice,
+			ExitPrice:      currentPrice,
+			Profit:         profit,
+			Status:         "closed",
+		}
+		database.LogTrade(pc.db, trade)
+		database.ClaimPosition(pc.db, pos.ID, currentPrice)
+
+		exited++
+	}
+
+	if exited > 0 {
+		utils.Logger.Warnf("⚠️  Exited %d bad positions", exited)
+	} else {
+		utils.Logger.Info("✅ All open positions validated — none need exiting")
+	}
+	return nil
 }

@@ -320,8 +320,8 @@ func (s *OracleLagStrategy) ScanOpportunities(ctx context.Context) (<-chan Oppor
 		result.MarketsScanned = len(markets)
 		utils.Logger.Infof("Checking %d markets for opportunities...", len(markets))
 
-		// Concurrent market scanning: up to 10 simultaneous IEM requests
-		sem := make(chan struct{}, 10)
+		// Concurrent market scanning: up to 3 simultaneous IEM requests (avoid TLS throttling)
+		sem := make(chan struct{}, 3)
 		var wg sync.WaitGroup
 		var resultMu sync.Mutex
 
@@ -575,7 +575,18 @@ func (s *OracleLagStrategy) ExecuteOpportunity(ctx context.Context, opp Opportun
 	positionSize := s.calculatePositionSize(opp.Confidence, opp.Edge, balance, opp.MarketQuestion)
 	if isReEntry {
 		positionSize *= ReEntryPositionMultiplier
+		if positionSize < 1.0 {
+			positionSize = 1.0
+		}
 		utils.Logger.Infof("🔄 Re-entry position size: $%.2f (50%% of normal)", positionSize)
+	}
+
+	// Polymarket requires minimum 5 shares per order.
+	// Ensure positionSize covers at least 5 shares at the current price.
+	minSizeForShares := 5.0 * opp.CurrentPrice
+	if positionSize < minSizeForShares {
+		positionSize = minSizeForShares
+		utils.Logger.Infof("Position size bumped to $%.2f to meet 5-share minimum at price $%.2f", positionSize, opp.CurrentPrice)
 	}
 
 	utils.Logger.Infof("Position size: $%.2f (%.0f%% of max due to %.1f%% confidence, %.1f%% edge)",
@@ -761,7 +772,7 @@ func (s *OracleLagStrategy) calculatePositionSize(confidence float64, edge float
 	// Combine multipliers
 	finalSize := baseSize * confidenceMultiplier * edgeMultiplier
 
-	// Ensure minimum size of at least $1
+	// Ensure minimum of $1 (actual share minimum is enforced at order time)
 	if finalSize < 1.0 && finalSize > 0 {
 		finalSize = 1.0
 	}
@@ -996,4 +1007,108 @@ func (s *OracleLagStrategy) outcomeWon(outcomes []string, prices []float64, held
 		}
 	}
 	return false
+}
+
+// ValidateAndExitBadPositions re-runs the IEM resolver against every open position.
+// Any position where the resolver disagrees (or says it's too early to know) is sold
+// immediately at the current market price. This catches trades placed by old/buggy code
+// before peak-hour gating was enforced.
+func (s *OracleLagStrategy) ValidateAndExitBadPositions(ctx context.Context) error {
+	utils.Logger.Info("🔎 Validating open positions against IEM resolver...")
+
+	positions, err := database.GetOpenPositions(s.db)
+	if err != nil {
+		return fmt.Errorf("failed to get open positions: %w", err)
+	}
+	if len(positions) == 0 {
+		utils.Logger.Info("No open positions to validate")
+		return nil
+	}
+
+	resolver := s.factory.GetIEMResolver()
+	exited := 0
+
+	for _, pos := range positions {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+
+		market, err := s.client.GetMarketByID(pos.MarketID)
+		if err != nil {
+			utils.Logger.Warnf("ValidatePositions: cannot fetch market %s: %v", pos.MarketID, err)
+			continue
+		}
+		if market.Closed {
+			continue
+		}
+
+		outcome, confidence, err := resolver.CheckResolution(*market)
+		if err != nil {
+			utils.Logger.Warnf("ValidatePositions: resolver error for %q: %v — keeping position", pos.MarketQuestion, err)
+			continue
+		}
+
+		var exitReason string
+		shouldExit := false
+
+		if outcome == nil {
+			// Pre-peak — resolver can't confirm yet. Keep the position.
+			// We only exit when the resolver ACTIVELY returns the opposite outcome.
+			utils.Logger.Debugf("ValidatePositions: %q pre-peak, holding %s", pos.MarketQuestion, pos.Outcome)
+		} else if !strings.EqualFold(*outcome, pos.Outcome) {
+			exitReason = fmt.Sprintf("resolver now says %s (we hold %s, confidence=%.0f%%)", *outcome, pos.Outcome, confidence*100)
+			shouldExit = true
+		}
+
+		if !shouldExit {
+			utils.Logger.Infof("✅ Position valid: %q → %s confirmed", pos.MarketQuestion, pos.Outcome)
+			continue
+		}
+
+		utils.Logger.Warnf("⚠️  BAD POSITION: %q (holding %s) — %s", pos.MarketQuestion, pos.Outcome, exitReason)
+
+		currentPrice := s.getCurrentPrice(*market, pos.Outcome)
+		if currentPrice <= 0 {
+			utils.Logger.Warnf("Cannot exit %q — no valid sell price", pos.MarketQuestion)
+			continue
+		}
+		if pos.TokenID == "" {
+			utils.Logger.Warnf("Cannot exit %q — no TokenID stored", pos.MarketQuestion)
+			continue
+		}
+
+		shares := pos.PositionSize / pos.EntryPrice
+		sellAmount := shares * currentPrice
+		if err := s.client.PlaceSellOrder(pos.TokenID, currentPrice, sellAmount); err != nil {
+			utils.Logger.Errorf("Failed to exit bad position %q: %v", pos.MarketQuestion, err)
+			continue
+		}
+
+		profit := sellAmount - pos.PositionSize
+		utils.Logger.Warnf("🚪 Exited bad position: %q | entry=$%.2f exit=$%.2f | P&L=$%.2f",
+			pos.MarketQuestion, pos.EntryPrice, currentPrice, profit)
+
+		trade := database.Trade{
+			MarketID:       pos.MarketID,
+			MarketQuestion: pos.MarketQuestion,
+			Outcome:        pos.Outcome,
+			EntryPrice:     pos.EntryPrice,
+			ExitPrice:      currentPrice,
+			Profit:         profit,
+			Status:         "closed",
+		}
+		database.LogTrade(s.db, trade)
+		database.ClaimPosition(s.db, pos.ID, currentPrice)
+
+		exited++
+	}
+
+	if exited > 0 {
+		utils.Logger.Warnf("🚨 Exited %d bad positions", exited)
+	} else {
+		utils.Logger.Info("✅ All open positions validated — none need exiting")
+	}
+	return nil
 }
