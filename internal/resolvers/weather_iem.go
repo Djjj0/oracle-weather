@@ -189,7 +189,7 @@ func (w *IEMWeatherResolver) CheckResolution(market polymarket.Market) (*string,
 
 	// Rain/precipitation markets: use dedicated precipitation endpoint
 	if data.Condition == "rain" || data.Condition == "precipitation" {
-		totalPrecip, err := w.getIEMPrecip(airportCode, data.Date)
+		totalPrecip, err := w.getIEMPrecip(airportCode, data.Date, loc)
 		if err != nil {
 			return nil, 0, fmt.Errorf("IEM precip API error: %w", err)
 		}
@@ -212,7 +212,9 @@ func (w *IEMWeatherResolver) CheckResolution(market polymarket.Market) (*string,
 	}
 
 	// Fetch the current running high from IEM (max of all observations so far today)
-	runningHigh, obsCount, err := w.getIEMHighTemp(airportCode, data.Date, useCelsius)
+	// Pass loc so IEM uses local midnight-to-midnight, not UTC (critical fix:
+	// UTC queries include the previous afternoon's readings for western timezones)
+	runningHigh, obsCount, err := w.getIEMHighTemp(airportCode, data.Date, useCelsius, loc)
 	if err != nil {
 		return nil, 0, fmt.Errorf("IEM API error: %w", err)
 	}
@@ -346,14 +348,22 @@ func (w *IEMWeatherResolver) determineOutcomeWithPeak(data *MarketData, runningH
 	return "", 0
 }
 
-// getIEMHighTemp fetches daily high temperature from IEM ASOS API
-func (w *IEMWeatherResolver) getIEMHighTemp(station string, date time.Time, celsius bool) (float64, int, error) {
-	// IEM ASOS API endpoint
+// getIEMHighTemp fetches daily high temperature from IEM ASOS API.
+// loc is the station's local timezone — used so the date range is midnight-to-midnight
+// local time, not UTC. Without this, western-timezone stations include the previous
+// afternoon's warm readings in what IEM calls "today's" UTC data.
+func (w *IEMWeatherResolver) getIEMHighTemp(station string, date time.Time, celsius bool, loc *time.Location) (float64, int, error) {
+	// Use the local calendar date so IEM returns midnight-to-midnight local time.
+	localDate := date.In(loc)
+	tzName := loc.String()
+
+	// IEM ASOS API endpoint — tz param makes IEM interpret dates in local time
 	url := fmt.Sprintf(
-		"https://mesonet.agron.iastate.edu/cgi-bin/request/asos.py?station=%s&data=tmpf&year1=%d&month1=%d&day1=%d&year2=%d&month2=%d&day2=%d&tz=UTC&format=onlycomma&latlon=no&elev=no&missing=null&trace=null&direct=no&report_type=3&report_type=4",
+		"https://mesonet.agron.iastate.edu/cgi-bin/request/asos.py?station=%s&data=tmpf&year1=%d&month1=%d&day1=%d&year2=%d&month2=%d&day2=%d&tz=%s&format=onlycomma&latlon=no&elev=no&missing=null&trace=null&direct=no&report_type=3&report_type=4",
 		station,
-		date.Year(), int(date.Month()), date.Day(),
-		date.Year(), int(date.Month()), date.Day(),
+		localDate.Year(), int(localDate.Month()), localDate.Day(),
+		localDate.Year(), int(localDate.Month()), localDate.Day(),
+		tzName,
 	)
 
 	resp, err := w.client.R().Get(url)
@@ -435,14 +445,17 @@ func marginToConfidence(marginDegrees float64) float64 {
 }
 
 // getIEMPrecip fetches hourly precipitation (p01i) from IEM ASOS for a given station/date
-// and returns the total precipitation in inches for that calendar day (UTC).
+// and returns the total precipitation in inches for that local calendar day.
 // A return value > 0 means it rained; 0 means no measurable precipitation.
-func (w *IEMWeatherResolver) getIEMPrecip(station string, date time.Time) (float64, error) {
+func (w *IEMWeatherResolver) getIEMPrecip(station string, date time.Time, loc *time.Location) (float64, error) {
+	localDate := date.In(loc)
+	tzName := loc.String()
 	url := fmt.Sprintf(
-		"https://mesonet.agron.iastate.edu/cgi-bin/request/asos.py?station=%s&data=p01i&year1=%d&month1=%d&day1=%d&year2=%d&month2=%d&day2=%d&tz=UTC&format=onlycomma&latlon=no&elev=no&missing=null&trace=null&direct=no&report_type=3&report_type=4",
+		"https://mesonet.agron.iastate.edu/cgi-bin/request/asos.py?station=%s&data=p01i&year1=%d&month1=%d&day1=%d&year2=%d&month2=%d&day2=%d&tz=%s&format=onlycomma&latlon=no&elev=no&missing=null&trace=null&direct=no&report_type=3&report_type=4",
 		station,
-		date.Year(), int(date.Month()), date.Day(),
-		date.Year(), int(date.Month()), date.Day(),
+		localDate.Year(), int(localDate.Month()), localDate.Day(),
+		localDate.Year(), int(localDate.Month()), localDate.Day(),
+		tzName,
 	)
 
 	resp, err := w.client.R().Get(url)
