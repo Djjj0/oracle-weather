@@ -12,6 +12,7 @@ import (
 
 	"github.com/djbro/oracle-weather/internal/config"
 	"github.com/djbro/oracle-weather/pkg/utils"
+	ethereum "github.com/ethereum/go-ethereum"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/ethclient"
@@ -351,14 +352,50 @@ func (c *PolymarketClientLixv) PlaceOrder(signedOrder *model.SignedOrder) error 
 	return nil
 }
 
-// GetBalance retrieves balance
+// usdcPolygon is the bridged USDC (USDC.e) contract on Polygon PoS (6 decimals).
+var usdcPolygon = common.HexToAddress("0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174")
+
+// GetBalance returns the USDC balance of the proxy wallet by calling balanceOf
+// on the USDC contract on Polygon. Falls back to a cached value on error.
 func (c *PolymarketClientLixv) GetBalance() (float64, error) {
 	c.rateLimiter.Wait(context.Background())
 
-	// TODO: Implement live balance checking via Polymarket API
-	// For now, return user's reported balance
-	// Bot will fail gracefully if insufficient funds
-	return 112.0, nil
+	if c.ethClient == nil {
+		utils.Logger.Warn("GetBalance: no Polygon RPC connection, returning fallback $0")
+		return 0, fmt.Errorf("no Polygon RPC connection")
+	}
+
+	proxyAddr := common.HexToAddress(c.config.ProxyAddress)
+
+	// balanceOf(address) selector = keccak256("balanceOf(address)")[0:4] = 0x70a08231
+	// ABI-encode the address as a 32-byte padded value
+	callData := make([]byte, 36)
+	copy(callData[0:4], common.Hex2Bytes("70a08231"))
+	copy(callData[16:36], proxyAddr.Bytes()) // 12 zero bytes padding + 20 address bytes
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	result, err := c.ethClient.CallContract(ctx, ethereum.CallMsg{
+		To:   &usdcPolygon,
+		Data: callData,
+	}, nil)
+	if err != nil {
+		return 0, fmt.Errorf("balanceOf call failed: %w", err)
+	}
+	if len(result) < 32 {
+		return 0, fmt.Errorf("unexpected balanceOf response length: %d", len(result))
+	}
+
+	// USDC has 6 decimals: divide raw uint256 by 1_000_000
+	raw := new(big.Int).SetBytes(result[:32])
+	balance, _ := new(big.Float).Quo(
+		new(big.Float).SetInt(raw),
+		big.NewFloat(1_000_000),
+	).Float64()
+
+	utils.Logger.Infof("On-chain USDC balance (proxy wallet %s): $%.2f", c.config.ProxyAddress, balance)
+	return balance, nil
 }
 
 // GetActiveMarkets retrieves all active markets

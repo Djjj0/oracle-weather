@@ -22,6 +22,7 @@ type Config struct {
 	AlchemyAPIKey  string
 	PolygonRPCURL  string
 	ChainID        int
+	ProxyAddress   string // Polymarket proxy wallet (holds USDC)
 
 	// Weather APIs (multi-source validation)
 	OpenWeatherAPIKey      string
@@ -90,6 +91,7 @@ func LoadConfig() (*Config, error) {
 		AlchemyAPIKey: os.Getenv("ALCHEMY_API_KEY"),
 		PolygonRPCURL: os.Getenv("POLYGON_RPC_URL"),
 		ChainID:       getEnvAsInt("CHAIN_ID", 137),
+		ProxyAddress:  getEnvOrDefault("POLYMARKET_PROXY_ADDRESS", "0x6ff7ae88DBBA1834f7647F4153Fe30897904931d"),
 
 		// Weather APIs (multi-source validation)
 		OpenWeatherAPIKey:     os.Getenv("OPENWEATHER_API_KEY"),
