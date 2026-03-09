@@ -422,13 +422,23 @@ func (c *PolymarketClientLixv) getLimitedMarkets(closedStatus string, maxCount i
 		c.rateLimiter.Wait(context.Background())
 
 		var page []Market
-		resp, err := c.gammaClient.R().
-			SetResult(&page).
-			SetQueryParam("closed", closedStatus).
-			SetQueryParam("limit", fmt.Sprintf("%d", pageSize)).
-			SetQueryParam("offset", fmt.Sprintf("%d", offset)).
-			Get("/markets")
-
+		var resp *resty.Response
+		var err error
+		for attempt := 0; attempt <= 3; attempt++ {
+			if attempt > 0 {
+				time.Sleep(time.Duration(attempt*3) * time.Second)
+				c.rateLimiter.Wait(context.Background())
+			}
+			resp, err = c.gammaClient.R().
+				SetResult(&page).
+				SetQueryParam("closed", closedStatus).
+				SetQueryParam("limit", fmt.Sprintf("%d", pageSize)).
+				SetQueryParam("offset", fmt.Sprintf("%d", offset)).
+				Get("/markets")
+			if err == nil {
+				break
+			}
+		}
 		if err != nil {
 			return nil, fmt.Errorf("failed to get markets (offset %d): %w", offset, err)
 		}
