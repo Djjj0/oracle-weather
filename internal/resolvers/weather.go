@@ -31,6 +31,7 @@ var cityTimezones = map[string]string{
 	// US Cities
 	"seattle":       "America/Los_Angeles",
 	"new york":      "America/New_York",
+	"new york city": "America/New_York",
 	"los angeles":   "America/Los_Angeles",
 	"chicago":       "America/Chicago",
 	"houston":       "America/Chicago",

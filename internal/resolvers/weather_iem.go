@@ -58,6 +58,7 @@ func NewIEMWeatherResolverWithDBs(cfg *config.Config, learningDB, intlDB *pkgwea
 var cityToAirport = map[string]string{
 	"seattle":        "KSEA",
 	"new york":       "KLGA", // LaGuardia — Polymarket uses KLGA not KJFK
+	"new york city":  "KLGA",
 	"los angeles":    "KLAX",
 	"chicago":        "KORD",
 	"houston":        "KIAH",
