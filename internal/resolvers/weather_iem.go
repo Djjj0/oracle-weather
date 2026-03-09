@@ -314,7 +314,10 @@ func (w *IEMWeatherResolver) checkObviousNo(data *MarketData, runningHigh float6
 	case "temperature_above":
 		// Cannot determine obvious NO early — temp might still rise to threshold
 	case "temperature_exact":
-		// Disabled entirely
+		// Running high already exceeded the exact value — NO is certain (can't go back down)
+		if roundedHigh > data.Threshold {
+			return true, marginToConfidence(runningHigh - data.Threshold)
+		}
 	}
 	return false, 0
 }
@@ -361,8 +364,21 @@ func (w *IEMWeatherResolver) determineOutcomeWithPeak(data *MarketData, runningH
 		}
 
 	case "temperature_exact":
-		// Exact-degree markets are too unpredictable — the high must land on
-		// a single integer. Skip entirely to avoid low-quality bets.
+		// YES bets are too unpredictable (high must land on a single integer).
+		// But NO is safe in two clear cases:
+		//   1. Running high already exceeded the exact value — it can't come back down.
+		//   2. Past peak and running high is still below — it won't reach that value.
+		if roundedHigh > data.Threshold {
+			return "No", marginToConfidence(runningHigh - data.Threshold)
+		}
+		if pastPeak && roundedHigh < data.Threshold {
+			margin := data.Threshold - runningHigh
+			if margin < 1.0 {
+				return "", 0 // Too close — skip
+			}
+			peakMarginBonus := math.Min((currentHour-typicalPeakHour-1.0)*0.05, 0.10)
+			return "No", math.Min(marginToConfidence(margin)+peakMarginBonus, 0.98)
+		}
 		return "", 0
 
 	case "temperature_range":
