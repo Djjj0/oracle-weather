@@ -544,33 +544,35 @@ func (c *PolymarketClientLixv) getMarkets(closedStatus string) ([]Market, error)
 	return allMarkets, nil
 }
 
-// GetWeatherMarkets fetches only weather-category markets directly, avoiding
-// full pagination of 30k+ markets. Much more resilient to API instability.
+// GetWeatherMarkets fetches temperature markets by scanning from the known offset
+// where they live in the Gamma API (~25000). This avoids paginating all 30k+ markets
+// and is resilient to Polymarket's HTTP/2 GOAWAY errors at high offsets.
 func (c *PolymarketClientLixv) GetWeatherMarkets() ([]Market, error) {
 	const pageSize = 500
+	// Temperature markets consistently appear around offset 24500-25500.
+	// Scan a window of ±2000 around that to handle drift over time.
+	const startOffset = 23000
+	const maxOffset = 27000
 	var allMarkets []Market
 
-	for offset := 0; ; offset += pageSize {
+	for offset := startOffset; offset <= maxOffset; offset += pageSize {
 		c.rateLimiter.Wait(context.Background())
 
 		var page []Market
 		resp, err := c.gammaClient.R().
 			SetResult(&page).
 			SetQueryParam("closed", "false").
-			SetQueryParam("category", "weather").
 			SetQueryParam("limit", fmt.Sprintf("%d", pageSize)).
 			SetQueryParam("offset", fmt.Sprintf("%d", offset)).
 			Get("/markets")
 
 		if err != nil {
-			if len(allMarkets) > 0 {
-				utils.Logger.Warnf("Weather market fetch interrupted at offset %d (%d markets), using partial: %v", offset, len(allMarkets), err)
-				break
-			}
-			return nil, fmt.Errorf("failed to get weather markets: %w", err)
+			utils.Logger.Warnf("Weather market fetch error at offset %d: %v", offset, err)
+			break
 		}
 		if resp.IsError() {
-			return nil, fmt.Errorf("API error fetching weather markets: %s", resp.Status())
+			utils.Logger.Warnf("Weather market API error at offset %d: %s", offset, resp.Status())
+			break
 		}
 		if len(page) == 0 {
 			break
@@ -597,6 +599,7 @@ func (c *PolymarketClientLixv) GetWeatherMarkets() ([]Market, error) {
 		}
 	}
 
+	utils.Logger.Infof("GetWeatherMarkets: fetched %d markets from offsets %d-%d", len(allMarkets), startOffset, maxOffset)
 	return allMarkets, nil
 }
 
