@@ -220,30 +220,44 @@ func (w *IEMWeatherResolver) CheckResolution(market polymarket.Market) (*string,
 		return nil, 0, fmt.Errorf("IEM API error: %w", err)
 	}
 
-	// Require at least 4 observations (≈4 hours of today's data) before trusting
-	// the running high for a YES bet. Early morning queries (e.g. 7am local) may
-	// only have 1-2 readings which could be stale overnight data.
-	const minObsForYes = 4
-	if obsCount < minObsForYes {
-		return nil, 0, fmt.Errorf("data not yet available (only %d observations so far today, need %d)", obsCount, minObsForYes)
-	}
-
 	now := time.Now().In(loc)
 	localDate := data.Date.In(loc)
 	currentHour := float64(now.Hour()) + float64(now.Minute())/60.0
 
-	utils.Logger.Debugf("IEM running high: %s (%s) on %s = %.1f%s at %.1f local hour",
-		data.Location, airportCode, data.Date.Format("2006-01-02"), runningHigh, unitSymbol, currentHour)
+	utils.Logger.Debugf("IEM running high: %s (%s) on %s = %.1f%s at %.1f local hour (obs=%d)",
+		data.Location, airportCode, data.Date.Format("2006-01-02"), runningHigh, unitSymbol, currentHour, obsCount)
 
 	// Determine typical peak hour for this city from learning DB
 	// Falls back to 15.0 (3 PM) if not yet in DB
 	typicalPeakHour := w.getTypicalPeakHour(data.Location, loc)
 
-	// Check if YES is already confirmed — running high already exceeds threshold.
-	// We can bet YES any time of day since the high can only go up.
+	// Check for an obvious NO: running high already clearly exceeds a ceiling threshold.
+	// This is safe with any number of observations — the high can only go up.
+	// e.g. Lucknow running high 34°C → safe NO on 37°C, 38°C, 39°C etc. immediately.
+	obviousNo, obviousConf := w.checkObviousNo(data, runningHigh)
+	if obviousNo && obsCount >= 1 {
+		utils.Logger.Infof("✅ IEM resolved: %s on %s | Running high: %.1f%s | Outcome: No (obvious) | Confidence: %.0f%%",
+			data.Location, localDate.Format("2006-01-02"), runningHigh, unitSymbol, obviousConf*100)
+		w.cache.Store(cacheKey, CachedResult{Outcome: "No", Confidence: obviousConf})
+		no := "No"
+		return &no, obviousConf, nil
+	}
+
+	// For all other outcomes (YES bets, or NO-after-peak bets) require enough observations
+	// to trust the running high isn't stale overnight data.
+	// Exception: after 8pm local the day is done — 2 obs is sufficient.
+	const minObsForYes = 4
+	const minObsLateDay = 2
+	effectiveMinObs := minObsForYes
+	if currentHour >= 20.0 {
+		effectiveMinObs = minObsLateDay
+	}
+	if obsCount < effectiveMinObs {
+		return nil, 0, fmt.Errorf("data not yet available (only %d observations so far today, need %d)", obsCount, effectiveMinObs)
+	}
+
 	outcome, confidence := w.determineOutcomeWithPeak(data, runningHigh, unitSymbol, currentHour, typicalPeakHour)
 	if outcome == "" {
-		// Not yet actionable
 		utils.Logger.Debugf("⏳ Not yet actionable: %s | Running high: %.1f%s | Now: %.1f local | Typical peak: %.1f",
 			data.Location, runningHigh, unitSymbol, currentHour, typicalPeakHour)
 		return nil, 0, nil
@@ -274,6 +288,35 @@ func (w *IEMWeatherResolver) getTypicalPeakHour(city string, loc *time.Location)
 		}
 	}
 	return 15.0 // Default: 3pm if no data
+}
+
+// checkObviousNo returns true if the running high already makes a NO outcome
+// certain regardless of time of day. Since temperature can only go up during
+// the day, a running high that already exceeds a ceiling (temperature_below,
+// temperature_range upper bound) is an immediate safe NO.
+// Similarly, for temperature_above/range we can bet NO only when the running
+// high is already above the ceiling — NOT when it's just below a threshold
+// (that requires peak-hour confirmation).
+func (w *IEMWeatherResolver) checkObviousNo(data *MarketData, runningHigh float64) (bool, float64) {
+	roundedHigh := math.Round(runningHigh)
+	switch data.Condition {
+	case "temperature_below":
+		// Running high already exceeds ceiling — NO is certain
+		if roundedHigh > data.Threshold {
+			return true, marginToConfidence(runningHigh - data.Threshold)
+		}
+	case "temperature_range":
+		tempHigh := data.Extra["temp_high"].(float64)
+		// Running high already above range ceiling — NO is certain
+		if roundedHigh > tempHigh {
+			return true, marginToConfidence(runningHigh - tempHigh)
+		}
+	case "temperature_above":
+		// Cannot determine obvious NO early — temp might still rise to threshold
+	case "temperature_exact":
+		// Disabled entirely
+	}
+	return false, 0
 }
 
 // determineOutcomeWithPeak decides whether to bet YES or NO based on:
