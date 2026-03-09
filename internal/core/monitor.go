@@ -47,8 +47,9 @@ const EarlyEntryWindow = 2 * time.Hour
 func (m *MarketMonitor) GetMarketsPastResolution(ctx context.Context) ([]polymarket.Market, error) {
 	utils.Logger.Info("Fetching active markets...")
 
-	// Get all active markets
-	markets, err := m.client.GetActiveMarkets()
+	// Fetch weather markets directly by category — avoids paginating 30k+ markets
+	// and is resilient to Polymarket API instability (GOAWAY errors at high offsets).
+	markets, err := m.client.GetWeatherMarkets()
 	if err != nil {
 		return nil, fmt.Errorf("failed to get active markets: %w", err)
 	}
@@ -66,7 +67,8 @@ func (m *MarketMonitor) GetMarketsPastResolution(ctx context.Context) ([]polymar
 			continue
 		}
 
-		// ONLY scan weather markets (we haven't implemented crypto/sports yet)
+		// Category already filtered to weather by API query, but also check question
+		// for any mis-tagged markets slipping through
 		category := m.CategorizeMarket(market)
 		if category != "weather" {
 			continue

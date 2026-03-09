@@ -544,6 +544,62 @@ func (c *PolymarketClientLixv) getMarkets(closedStatus string) ([]Market, error)
 	return allMarkets, nil
 }
 
+// GetWeatherMarkets fetches only weather-category markets directly, avoiding
+// full pagination of 30k+ markets. Much more resilient to API instability.
+func (c *PolymarketClientLixv) GetWeatherMarkets() ([]Market, error) {
+	const pageSize = 500
+	var allMarkets []Market
+
+	for offset := 0; ; offset += pageSize {
+		c.rateLimiter.Wait(context.Background())
+
+		var page []Market
+		resp, err := c.gammaClient.R().
+			SetResult(&page).
+			SetQueryParam("closed", "false").
+			SetQueryParam("category", "weather").
+			SetQueryParam("limit", fmt.Sprintf("%d", pageSize)).
+			SetQueryParam("offset", fmt.Sprintf("%d", offset)).
+			Get("/markets")
+
+		if err != nil {
+			if len(allMarkets) > 0 {
+				utils.Logger.Warnf("Weather market fetch interrupted at offset %d (%d markets), using partial: %v", offset, len(allMarkets), err)
+				break
+			}
+			return nil, fmt.Errorf("failed to get weather markets: %w", err)
+		}
+		if resp.IsError() {
+			return nil, fmt.Errorf("API error fetching weather markets: %s", resp.Status())
+		}
+		if len(page) == 0 {
+			break
+		}
+
+		allMarkets = append(allMarkets, page...)
+
+		if len(page) < pageSize {
+			break
+		}
+	}
+
+	fetchTime := time.Now()
+	for i := range allMarkets {
+		allMarkets[i].FetchedAt = fetchTime
+		if allMarkets[i].OutcomesStr != "" {
+			allMarkets[i].Outcomes = parseJSONStringArray(allMarkets[i].OutcomesStr)
+		}
+		if allMarkets[i].TokenIDsStr != "" {
+			allMarkets[i].TokenIDs = parseJSONStringArray(allMarkets[i].TokenIDsStr)
+		}
+		if allMarkets[i].OutcomePricesStr != "" {
+			allMarkets[i].Prices = parseOutcomePrices(allMarkets[i].OutcomePricesStr)
+		}
+	}
+
+	return allMarkets, nil
+}
+
 // GetMarketByID retrieves a specific market
 func (c *PolymarketClientLixv) GetMarketByID(marketID string) (*Market, error) {
 	c.rateLimiter.Wait(context.Background())
