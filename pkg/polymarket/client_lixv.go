@@ -440,6 +440,11 @@ func (c *PolymarketClientLixv) getLimitedMarkets(closedStatus string, maxCount i
 			}
 		}
 		if err != nil {
+			// Return partial results rather than failing the whole scan
+			if len(allMarkets) > 0 {
+				utils.Logger.Warnf("Market fetch interrupted at offset %d (%d markets fetched), using partial results: %v", offset, len(allMarkets), err)
+				break
+			}
 			return nil, fmt.Errorf("failed to get markets (offset %d): %w", offset, err)
 		}
 
