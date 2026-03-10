@@ -95,15 +95,17 @@ func LogTrade(db *bolt.DB, trade Trade) error {
 	})
 }
 
-// LogOpportunity inserts an opportunity record
-func LogOpportunity(db *bolt.DB, opp Opportunity) error {
-	return db.Update(func(tx *bolt.Tx) error {
+// LogOpportunity inserts an opportunity record and returns the generated ID.
+func LogOpportunity(db *bolt.DB, opp Opportunity) (uint64, error) {
+	var assignedID uint64
+	err := db.Update(func(tx *bolt.Tx) error {
 		b := tx.Bucket(opportunitiesBucket)
 
 		// Generate ID
 		id, _ := b.NextSequence()
 		opp.ID = id
 		opp.Timestamp = time.Now()
+		assignedID = id
 
 		// Encode opportunity
 		encoded, err := json.Marshal(opp)
@@ -113,6 +115,31 @@ func LogOpportunity(db *bolt.DB, opp Opportunity) error {
 
 		// Store opportunity
 		return b.Put(itob(id), encoded)
+	})
+	return assignedID, err
+}
+
+// MarkOpportunityExecuted flips the Executed flag on an opportunity record.
+func MarkOpportunityExecuted(db *bolt.DB, oppID uint64) error {
+	return db.Update(func(tx *bolt.Tx) error {
+		b := tx.Bucket(opportunitiesBucket)
+		if b == nil {
+			return fmt.Errorf("opportunities bucket not found")
+		}
+		v := b.Get(itob(oppID))
+		if v == nil {
+			return fmt.Errorf("opportunity not found: %d", oppID)
+		}
+		var opp Opportunity
+		if err := json.Unmarshal(v, &opp); err != nil {
+			return fmt.Errorf("failed to decode opportunity: %w", err)
+		}
+		opp.Executed = true
+		encoded, err := json.Marshal(opp)
+		if err != nil {
+			return fmt.Errorf("failed to encode opportunity: %w", err)
+		}
+		return b.Put(itob(oppID), encoded)
 	})
 }
 

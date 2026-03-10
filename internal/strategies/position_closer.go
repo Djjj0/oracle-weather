@@ -15,17 +15,21 @@ import (
 
 // PositionCloser automatically closes positions when profitable or resolved
 type PositionCloser struct {
-	client *polymarket.PolymarketClient
-	db     *bolt.DB
-	config *config.Config
+	client   *polymarket.PolymarketClient
+	db       *bolt.DB
+	config   *config.Config
+	resolver resolvers.Resolver // shared resolver to avoid extra DB connections
 }
 
-// NewPositionCloser creates a new position closer
-func NewPositionCloser(client *polymarket.PolymarketClient, db *bolt.DB, cfg *config.Config) *PositionCloser {
+// NewPositionCloser creates a new position closer.
+// Pass the shared IEMWeatherResolver from the factory so we don't open extra
+// learning DB connections (which cause SQLITE_BUSY under concurrent workloads).
+func NewPositionCloser(client *polymarket.PolymarketClient, db *bolt.DB, cfg *config.Config, resolver resolvers.Resolver) *PositionCloser {
 	return &PositionCloser{
-		client: client,
-		db:     db,
-		config: cfg,
+		client:   client,
+		db:       db,
+		config:   cfg,
+		resolver: resolver,
 	}
 }
 
@@ -190,7 +194,13 @@ func (pc *PositionCloser) ValidateAndExitBadPositions(ctx context.Context) error
 		return nil
 	}
 
-	resolver := resolvers.NewIEMWeatherResolver(pc.config)
+	// Use the pre-opened shared resolver to avoid spawning extra DB connections.
+	resolver := pc.resolver
+	if resolver == nil {
+		// Fallback: create a standalone resolver (will open its own DB connections)
+		utils.Logger.Warnf("ValidatePositions: no shared resolver provided, opening standalone IEM resolver")
+		resolver = resolvers.NewIEMWeatherResolver(pc.config)
+	}
 	exited := 0
 
 	for _, pos := range positions {

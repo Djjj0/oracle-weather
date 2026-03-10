@@ -20,6 +20,7 @@ type IEMWeatherResolver struct {
 	BaseResolver
 	config     *config.Config
 	client     *resty.Client
+	parser     *WeatherResolver // shared parser, no DB connection — avoids SQLITE_BUSY
 	cache      sync.Map
 	learningDB *pkgweather.LearningDB // US cities
 	intlDB     *pkgweather.LearningDB // International cities
@@ -51,6 +52,7 @@ func NewIEMWeatherResolverWithDBs(cfg *config.Config, learningDB, intlDB *pkgwea
 		cache:      sync.Map{},
 		learningDB: learningDB,
 		intlDB:     intlDB,
+		parser:     &WeatherResolver{config: cfg, client: resty.New().SetTimeout(10 * time.Second)},
 	}
 }
 
@@ -182,7 +184,8 @@ func (w *IEMWeatherResolver) CheckResolution(market polymarket.Market) (*string,
 	}
 
 	// Check cache (short TTL - data updates hourly so don't cache too long)
-	cacheKey := fmt.Sprintf("%s_%s_%s", data.Location, data.Date.Format("2006-01-02"), data.Condition)
+	// Include threshold in key so adjacent exact-temp markets (27°C vs 28°C) don't collide.
+	cacheKey := fmt.Sprintf("%s_%s_%s_%.1f", data.Location, data.Date.Format("2006-01-02"), data.Condition, data.Threshold)
 	if cached, ok := w.cache.Load(cacheKey); ok {
 		result := cached.(CachedResult)
 		return &result.Outcome, result.Confidence, nil
@@ -221,8 +224,18 @@ func (w *IEMWeatherResolver) CheckResolution(market polymarket.Market) (*string,
 	}
 
 	now := time.Now().In(loc)
-	localDate := data.Date.In(loc)
 	currentHour := float64(now.Hour()) + float64(now.Minute())/60.0
+
+	// If the current local calendar day has advanced past the market's UTC date
+	// (e.g. Wellington UTC+13 where noon UTC = next local day), the market day is
+	// completely done — force currentHour past peak so NO bets fire correctly.
+	marketUTCYearDay := data.Date.UTC().YearDay()
+	nowLocalYearDay := now.YearDay()
+	if now.Year() > data.Date.UTC().Year() || nowLocalYearDay > marketUTCYearDay {
+		currentHour = 24.0
+	}
+
+	localDate := data.Date.In(loc)
 
 	utils.Logger.Debugf("IEM running high: %s (%s) on %s = %.1f%s at %.1f local hour (obs=%d)",
 		data.Location, airportCode, data.Date.Format("2006-01-02"), runningHigh, unitSymbol, currentHour, obsCount)
@@ -270,24 +283,115 @@ func (w *IEMWeatherResolver) CheckResolution(market polymarket.Market) (*string,
 	return &outcome, confidence, nil
 }
 
-// getTypicalPeakHour returns the typical hour (local time) when the daily high is reached
-// for a given city, using the learning DB. Falls back to 15.0 (3 PM) if no data.
+// getTypicalPeakHour returns the optimal entry hour for a city from the learning DB.
+// OptimalEntryHour = avgHighTempHour + 1h safety buffer, so pastPeak fires at the
+// right time based on actual historical data rather than a generic default.
+// Falls back to cityDefaultPeakHour if no learning data (< 5 markets).
 func (w *IEMWeatherResolver) getTypicalPeakHour(city string, loc *time.Location) float64 {
 	cityLC := strings.ToLower(city)
 
 	// Check US DB first
 	if w.learningDB != nil {
 		if stats, err := w.learningDB.GetCityStats(cityLC); err == nil && stats.TotalMarkets >= 5 {
-			return stats.AvgHighTempHour
+			return stats.OptimalEntryHour
 		}
 	}
 	// Fall back to international DB
 	if w.intlDB != nil {
 		if stats, err := w.intlDB.GetCityStats(cityLC); err == nil && stats.TotalMarkets >= 5 {
-			return stats.AvgHighTempHour
+			return stats.OptimalEntryHour
 		}
 	}
-	return 15.0 // Default: 3pm if no data
+	return cityDefaultPeakHour(cityLC) // City-specific default if no learning DB data
+}
+
+// cityDefaultPeakHour returns a reasonable default peak hour for a city when
+// the learning database has insufficient data. These are based on typical
+// climatology — coastal/humid cities peak later, desert/continental cities
+// peak earlier. All values are local solar time (hour of day, 24h).
+func cityDefaultPeakHour(city string) float64 {
+	defaults := map[string]float64{
+		// North America — continental interior peaks early-mid afternoon
+		"chicago":       15.0,
+		"dallas":        15.0,
+		"denver":        14.5,
+		"houston":       15.0,
+		"kansas city":   15.0,
+		"minneapolis":   14.5,
+		"nashville":     15.0,
+		"memphis":       15.0,
+		"austin":        15.0,
+		"san antonio":   15.0,
+		"detroit":       15.0,
+		"charlotte":     15.0,
+		"atlanta":       15.0,
+		"washington":    15.0,
+		"philadelphia":  15.0,
+		"boston":        15.0,
+		"new york":      15.0,
+		"new york city": 15.0,
+		// Coastal US — marine influence delays peak
+		"seattle":       15.5,
+		"portland":      15.5,
+		"san francisco": 15.5,
+		"los angeles":   15.5,
+		"san diego":     15.5,
+		"miami":         14.5, // tropical — peaks earlier due to afternoon storms
+		"tampa":         14.5,
+		"orlando":       14.5,
+		// Desert Southwest
+		"phoenix": 15.0,
+		"las vegas": 15.0,
+		// Canada
+		"toronto": 15.0,
+		// South America — subtropical, peaks mid-afternoon
+		"buenos aires": 15.0,
+		"sao paulo":    14.0, // tropical, convective — peaks early
+		// Europe — generally peaks around 14:00-15:00 local
+		"london":    14.0,
+		"paris":     14.5,
+		"berlin":    14.5,
+		"madrid":    16.0, // Mediterranean — late peak
+		"barcelona": 16.0,
+		"rome":      15.5,
+		"milan":     15.0,
+		"munich":    14.5,
+		"frankfurt": 14.5,
+		"amsterdam": 14.5,
+		"brussels":  14.5,
+		"vienna":    15.0,
+		"prague":    15.0,
+		"warsaw":    15.0,
+		"budapest":  15.5,
+		"zurich":    14.5,
+		"stockholm": 14.0,
+		"copenhagen":14.0,
+		"oslo":      14.0,
+		"helsinki":  14.0,
+		"lisbon":    16.0, // Iberian — late peak
+		"athens":    15.5,
+		"moscow":    14.0,
+		// Asia — varies significantly
+		"dubai":      15.0, // desert, but sea breeze limits peak
+		"mumbai":     14.0, // coastal, humid — peaks before afternoon convection
+		"delhi":      15.0,
+		"lucknow":    15.0,
+		"ankara":     15.0,
+		"beijing":    15.0,
+		"shanghai":   14.5,
+		"hong kong":  14.0, // subtropical coastal
+		"singapore":  13.0, // equatorial — peaks early before afternoon storms
+		"seoul":      14.0,
+		"tokyo":      14.0,
+		// Oceania
+		"sydney":     15.0,
+		"melbourne":  15.0,
+		"wellington": 14.0, // windy, maritime
+	}
+	if h, ok := defaults[city]; ok {
+		return h
+	}
+	return 15.0 // Conservative fallback
 }
 
 // checkObviousNo returns true if the running high already makes a NO outcome
@@ -364,17 +468,23 @@ func (w *IEMWeatherResolver) determineOutcomeWithPeak(data *MarketData, runningH
 		}
 
 	case "temperature_exact":
-		// YES bets are too unpredictable (high must land on a single integer).
-		// But NO is safe in two clear cases:
+		// NO cases (safe any time):
 		//   1. Running high already exceeded the exact value — it can't come back down.
-		//   2. Past peak and running high is still below — it won't reach that value.
 		if roundedHigh > data.Threshold {
 			return "No", marginToConfidence(runningHigh - data.Threshold)
 		}
-		if pastPeak && roundedHigh < data.Threshold {
+		if pastPeak {
+			if roundedHigh == data.Threshold {
+				// Past peak and running high matches exactly — bet YES.
+				// The high has hit this value and we're past the peak so it's
+				// unlikely to go higher. Small bonus for each extra hour past peak.
+				peakMarginBonus := math.Min((currentHour-typicalPeakHour-1.0)*0.05, 0.10)
+				return "Yes", math.Min(0.80+peakMarginBonus, 0.92)
+			}
+			// Past peak and still below — won't reach exact value, bet NO.
 			margin := data.Threshold - runningHigh
-			if margin < 1.0 {
-				return "", 0 // Too close — skip
+			if margin < 2.0 {
+				return "", 0 // Too close to boundary — skip
 			}
 			peakMarginBonus := math.Min((currentHour-typicalPeakHour-1.0)*0.05, 0.10)
 			return "No", math.Min(marginToConfidence(margin)+peakMarginBonus, 0.98)
@@ -413,16 +523,20 @@ func (w *IEMWeatherResolver) determineOutcomeWithPeak(data *MarketData, runningH
 // local time, not UTC. Without this, western-timezone stations include the previous
 // afternoon's warm readings in what IEM calls "today's" UTC data.
 func (w *IEMWeatherResolver) getIEMHighTemp(station string, date time.Time, celsius bool, loc *time.Location) (float64, int, error) {
-	// Use the local calendar date so IEM returns midnight-to-midnight local time.
-	localDate := date.In(loc)
+	// Use the UTC calendar date from the market question (e.g. "March 9") as the
+	// year/month/day for the IEM query. The tz param tells IEM to interpret that
+	// calendar date in the station's local midnight-to-midnight window.
+	// Do NOT use date.In(loc) — for high-UTC-offset cities like Wellington (UTC+13)
+	// noon UTC on March 9 converts to March 10 NZDT, causing IEM to query the wrong day.
+	utcDate := date.UTC()
 	tzName := loc.String()
 
 	// IEM ASOS API endpoint — tz param makes IEM interpret dates in local time
 	url := fmt.Sprintf(
 		"https://mesonet.agron.iastate.edu/cgi-bin/request/asos.py?station=%s&data=tmpf&year1=%d&month1=%d&day1=%d&year2=%d&month2=%d&day2=%d&tz=%s&format=onlycomma&latlon=no&elev=no&missing=null&trace=null&direct=no&report_type=3&report_type=4",
 		station,
-		localDate.Year(), int(localDate.Month()), localDate.Day(),
-		localDate.Year(), int(localDate.Month()), localDate.Day(),
+		utcDate.Year(), int(utcDate.Month()), utcDate.Day(),
+		utcDate.Year(), int(utcDate.Month()), utcDate.Day(),
 		tzName,
 	)
 
@@ -508,13 +622,13 @@ func marginToConfidence(marginDegrees float64) float64 {
 // and returns the total precipitation in inches for that local calendar day.
 // A return value > 0 means it rained; 0 means no measurable precipitation.
 func (w *IEMWeatherResolver) getIEMPrecip(station string, date time.Time, loc *time.Location) (float64, error) {
-	localDate := date.In(loc)
+	utcDate := date.UTC()
 	tzName := loc.String()
 	url := fmt.Sprintf(
 		"https://mesonet.agron.iastate.edu/cgi-bin/request/asos.py?station=%s&data=p01i&year1=%d&month1=%d&day1=%d&year2=%d&month2=%d&day2=%d&tz=%s&format=onlycomma&latlon=no&elev=no&missing=null&trace=null&direct=no&report_type=3&report_type=4",
 		station,
-		localDate.Year(), int(localDate.Month()), localDate.Day(),
-		localDate.Year(), int(localDate.Month()), localDate.Day(),
+		utcDate.Year(), int(utcDate.Month()), utcDate.Day(),
+		utcDate.Year(), int(utcDate.Month()), utcDate.Day(),
 		tzName,
 	)
 
@@ -562,9 +676,7 @@ func (w *IEMWeatherResolver) getIEMPrecip(station string, date time.Time, loc *t
 	return totalPrecip, nil
 }
 
-// ParseMarketQuestion delegates to base weather resolver
+// ParseMarketQuestion delegates to the shared parser (no DB open — avoids SQLITE_BUSY)
 func (w *IEMWeatherResolver) ParseMarketQuestion(question string) (*MarketData, error) {
-	// Use the existing weather resolver's parsing logic
-	wr := NewWeatherResolver(w.config)
-	return wr.ParseMarketQuestion(question)
+	return w.parser.ParseMarketQuestion(question)
 }

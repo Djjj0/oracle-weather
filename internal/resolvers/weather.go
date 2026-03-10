@@ -11,7 +11,6 @@ import (
 	"time"
 
 	"github.com/djbro/oracle-weather/internal/config"
-	"github.com/djbro/oracle-weather/pkg/utils"
 	"github.com/djbro/oracle-weather/pkg/weather"
 	"github.com/go-resty/resty/v2"
 )
@@ -109,21 +108,19 @@ func getTimezone(city string) string {
 	return "UTC"
 }
 
-// NewWeatherResolver creates a new weather resolver
+// NewWeatherResolver creates a new weather resolver.
+// NOTE: WeatherResolver is a question parser only — it does NOT open a learning DB.
+// Live resolution is handled exclusively by IEMWeatherResolver (which receives the
+// shared DB connections from the factory). Opening a third connection here was the
+// primary source of SQLITE_BUSY contention.
 func NewWeatherResolver(cfg *config.Config) *WeatherResolver {
 	client := resty.New()
 	client.SetTimeout(10 * time.Second)
 
-	learningDB, err := weather.NewLearningDB("./data/learning.db")
-	if err != nil {
-		utils.Logger.Warnf("Failed to open learning database: %v - will use fallback timing", err)
-		learningDB = nil
-	}
-
 	resolver := &WeatherResolver{
 		config:     cfg,
 		client:     client,
-		learningDB: learningDB,
+		learningDB: nil, // No DB — parser role only; IEMWeatherResolver owns the DB connections
 	}
 	resolver.SetConfidence(0.95)
 

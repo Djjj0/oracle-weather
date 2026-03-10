@@ -35,15 +35,19 @@ func NewMonitor(client *polymarket.PolymarketClient, config *config.Config) *Mar
 	}
 }
 
-// EarlyEntryWindow is how far ahead of resolution we allow entry when the IEM
-// resolver already has a confirmed outcome (e.g. running high already exceeds
-// the threshold, so resolution is a foregone conclusion).
-const EarlyEntryWindow = 2 * time.Hour
+// EarlyEntryWindow is how far ahead of resolution we include a market in the scan.
+// This must be large enough to cover the gap between when the daily outcome becomes
+// deterministic (after the city's local peak hour, typically 3-4pm local) and when
+// Polymarket's official resolution timestamp fires (typically midnight local).
+// For example, London peaks at ~15:00 UTC and resolves at ~00:00 UTC — a 9-hour gap.
+// With a 2h window the bot never sees the market during that profitable window.
+// 14h covers the worst case (Seattle peaks at 21:00 UTC, resolves at ~07:00 UTC next day).
+const EarlyEntryWindow = 14 * time.Hour
 
 // GetMarketsPastResolution returns weather markets that are eligible for trading:
 //   - Markets where resolution time has already passed (classic oracle-lag), OR
-//   - Markets resolving within the next EarlyEntryWindow (2 h) where the IEM
-//     resolver may already have a confirmed outcome based on intraday data.
+//   - Markets resolving within the next EarlyEntryWindow (14 h) so the bot can
+//     act as soon as the city's daily high is confirmed, long before official resolution.
 func (m *MarketMonitor) GetMarketsPastResolution(ctx context.Context) ([]polymarket.Market, error) {
 	utils.Logger.Info("Fetching active markets...")
 

@@ -106,25 +106,28 @@ func (mf *MarketFilter) GetBlacklistSize() int {
 	return len(mf.blacklist)
 }
 
-// calculateSpread calculates the bid-ask spread
+// calculateSpread calculates the parity drift for binary markets.
+// NOTE: This is NOT a true bid/ask spread. It measures how far YES+NO prices
+// deviate from the expected sum of 1.0 (parity check). A large deviation
+// indicates an illiquid or mis-priced book. Rename candidate: "calculateParityDrift".
 func calculateSpread(prices []float64) float64 {
 	if len(prices) < 2 {
 		return 0
 	}
 
 	// In binary markets: YES price + NO price should = 1.0
-	// Spread = |1.0 - (YES + NO)|
+	// Parity drift = |1.0 - (YES + NO)|
 	sum := 0.0
 	for _, price := range prices {
 		sum += price
 	}
 
-	spread := 1.0 - sum
-	if spread < 0 {
-		spread = -spread
+	drift := 1.0 - sum
+	if drift < 0 {
+		drift = -drift
 	}
 
-	return spread
+	return drift
 }
 
 // defaultBadPatterns returns question patterns to avoid

@@ -132,6 +132,7 @@ type Opportunity struct {
 	Lag            time.Duration
 	Timestamp      time.Time
 	Reasoning      string // Human-readable explanation of why this trade was selected
+	DBOpportunityID uint64 // BoltDB ID of the logged Opportunity record (for flip-to-executed)
 }
 
 // TemperatureBucket represents a temperature range bucket
@@ -463,8 +464,10 @@ func (s *OracleLagStrategy) ScanOpportunities(ctx context.Context) (<-chan Oppor
 					ExpectedProfit: opp.ExpectedProfit,
 					Executed:       false,
 				}
-				if err := database.LogOpportunity(s.db, dbOpp); err != nil {
+				if oppID, err := database.LogOpportunity(s.db, dbOpp); err != nil {
 					utils.Logger.Errorf("Failed to log opportunity: %v", err)
+				} else {
+					opp.DBOpportunityID = oppID
 				}
 
 				resultMu.Lock()
@@ -593,6 +596,18 @@ func (s *OracleLagStrategy) ExecuteOpportunity(ctx context.Context, opp Opportun
 		utils.Logger.Infof("Live balance: $%.2f | PositionSizePct: %.1f%%", balance, s.config.PositionSizePct*100)
 	}
 
+	// Subtract current open exposure so we don't over-commit capital.
+	if balance > 0 {
+		if exposure, expErr := database.GetTotalExposure(s.db); expErr == nil && exposure > 0 {
+			utils.Logger.Infof("Open position exposure: $%.2f — adjusting available balance from $%.2f to $%.2f",
+				exposure, balance, balance-exposure)
+			balance -= exposure
+			if balance < 0 {
+				balance = 0
+			}
+		}
+	}
+
 	// Calculate position size based on edge, confidence, live balance, and market question
 	positionSize := s.calculatePositionSize(opp.Confidence, opp.Edge, balance, opp.MarketQuestion)
 	if isReEntry {
@@ -603,17 +618,17 @@ func (s *OracleLagStrategy) ExecuteOpportunity(ctx context.Context, opp Opportun
 		utils.Logger.Infof("🔄 Re-entry position size: $%.2f (50%% of normal)", positionSize)
 	}
 
-	// Polymarket SDK expects size in number of shares (not USDC).
-	// Convert USDC positionSize to shares, then enforce the 5-share minimum.
-	sharesAmount := positionSize / opp.CurrentPrice
-	if sharesAmount < 5.0 {
-		sharesAmount = 5.0
-		positionSize = sharesAmount * opp.CurrentPrice // keep in sync for logging/DB
-		utils.Logger.Infof("Shares bumped to 5.0 to meet minimum (cost: $%.2f at price $%.2f)", positionSize, opp.CurrentPrice)
+	// Enforce 5-share minimum: compute shares from current price and bump positionSize if needed.
+	// NOTE: sharesAmount is computed inside the retry loop (Fix #4) so it always reflects
+	// the latest opp.CurrentPrice after a price update on retry.
+	minSharesCheck := positionSize / opp.CurrentPrice
+	if minSharesCheck < 5.0 {
+		positionSize = 5.0 * opp.CurrentPrice
+		utils.Logger.Infof("Position bumped to 5-share minimum (cost: $%.2f at price $%.2f)", positionSize, opp.CurrentPrice)
 	}
 
-	utils.Logger.Infof("Position size: $%.2f / %.2f shares (%.0f%% of max due to %.1f%% confidence, %.1f%% edge)",
-		positionSize, sharesAmount, (positionSize/s.config.MaxPositionSize)*100, opp.Confidence*100, opp.Edge*100)
+	utils.Logger.Infof("Position size: $%.2f (%.0f%% of max due to %.1f%% confidence, %.1f%% edge)",
+		positionSize, (positionSize/s.config.MaxPositionSize)*100, opp.Confidence*100, opp.Edge*100)
 
 	// PHASE 7: Check gas price profitability
 	shouldExecute, reason := s.client.ShouldExecuteTrade(opp.ExpectedProfit, positionSize)
@@ -622,11 +637,19 @@ func (s *OracleLagStrategy) ExecuteOpportunity(ctx context.Context, opp Opportun
 		return fmt.Errorf("gas cost too high: %s", reason)
 	}
 
-	// Place market order with retry logic (up to 3 attempts)
+	// Place market order with retry logic (up to 3 attempts).
+	// sharesAmount is recomputed on every attempt so a price update on retry yields
+	// the correct share count for the new price (Fix #4 — stale shares bug).
+	// PlaceMarketOrder / CreateOrder expects size in USDC dollars, not shares (Fix #3).
 	maxRetries := 3
 	var orderErr error
 	for attempt := 1; attempt <= maxRetries; attempt++ {
-		orderErr = s.client.PlaceMarketOrder(opp.TokenID, opp.CurrentPrice, sharesAmount)
+		// Recompute shares from the current (possibly updated) price each attempt.
+		sharesAmount := positionSize / opp.CurrentPrice
+		utils.Logger.Debugf("Order attempt %d/%d: price=$%.4f size=$%.2f shares=%.2f",
+			attempt, maxRetries, opp.CurrentPrice, positionSize, sharesAmount)
+
+		orderErr = s.client.PlaceMarketOrder(opp.TokenID, opp.CurrentPrice, positionSize)
 		if orderErr == nil {
 			// Success!
 			break
@@ -673,6 +696,7 @@ func (s *OracleLagStrategy) ExecuteOpportunity(ctx context.Context, opp Opportun
 			utils.Logger.Infof("🔄 Retrying with updated price: $%.2f (profit: %.2f%%)", freshPrice, newExpectedProfit)
 			opp.CurrentPrice = freshPrice
 			opp.ExpectedProfit = newExpectedProfit / 100
+			// positionSize stays the same in USDC; sharesAmount will be recomputed next iteration
 		} else {
 			utils.Logger.Warnf("Fresh price $%.2f no longer profitable (%.2f%% < %.2f%%)",
 				freshPrice, newExpectedProfit, s.config.MinProfitThreshold*100)
@@ -681,6 +705,14 @@ func (s *OracleLagStrategy) ExecuteOpportunity(ctx context.Context, opp Opportun
 	}
 
 	utils.Logger.Infof("✅ Order placed successfully")
+
+	// Flip the Executed flag on the logged opportunity record now that the order succeeded.
+	if opp.DBOpportunityID > 0 {
+		if err := database.MarkOpportunityExecuted(s.db, opp.DBOpportunityID); err != nil {
+			utils.Logger.Warnf("Failed to mark opportunity #%d as executed: %v", opp.DBOpportunityID, err)
+		}
+	}
+
 
 	// Record open position
 	position := database.Position{
@@ -884,6 +916,52 @@ type RedemptionResult struct {
 	Pending    int
 }
 
+// recordLearning writes the resolved market outcome to the learning DB so that
+// OptimalEntryHour is refined over time from actual trade results.
+func (s *OracleLagStrategy) recordLearning(pos database.Position, success bool) {
+	// Extract city from market question (e.g. "Will the highest temperature in London be...")
+	cityRe := regexp.MustCompile(`(?i)in ([A-Za-z\s]+?) (?:be|on)`)
+	city := ""
+	if m := cityRe.FindStringSubmatch(pos.MarketQuestion); len(m) > 1 {
+		city = strings.TrimSpace(m[1])
+	}
+	if city == "" {
+		return
+	}
+
+	ldb := s.factory.LearningDBForCity(city)
+	if ldb == nil {
+		return
+	}
+
+	// Look up timezone for this city
+	var tz string
+	if stats, err := ldb.GetCityStats(strings.ToLower(city)); err == nil {
+		tz = stats.Timezone
+	}
+	if tz == "" {
+		tz = "UTC"
+	}
+
+	// Use position entry time as the "optimal entry" observation point —
+	// over many trades this converges to the real optimal hour.
+	err := ldb.RecordMarketOutcome(
+		pos.MarketID,
+		city,
+		tz,
+		pos.EntryTime, // market date (close enough for daily granularity)
+		0,            // high temp unknown here; leave zero
+		pos.EntryTime,
+		pos.EntryTime,
+		success,
+	)
+	if err != nil {
+		utils.Logger.Debugf("Learning DB update for %s: %v", city, err)
+	} else {
+		utils.Logger.Debugf("Learning DB updated for %s (success=%v)", city, success)
+	}
+}
+
 // CheckAndClaimPositions checks all open positions and claims resolved ones
 func (s *OracleLagStrategy) CheckAndClaimPositions(ctx context.Context) (*RedemptionResult, error) {
 	positions, err := database.GetOpenPositions(s.db)
@@ -908,6 +986,16 @@ func (s *OracleLagStrategy) CheckAndClaimPositions(ctx context.Context) (*Redemp
 
 		market, err := s.client.GetMarketByID(pos.MarketID)
 		if err != nil {
+			// 403/404 means market is no longer accessible — likely resolved and archived.
+			// Stop retrying; record as a loss to clear it from open positions.
+			errStr := err.Error()
+			if strings.Contains(errStr, "403") || strings.Contains(errStr, "404") || strings.Contains(errStr, "Forbidden") {
+				utils.Logger.Warnf("⚠️  Position #%d (%s): market no longer accessible (%v) — marking as lost",
+					pos.ID, pos.MarketQuestion, err)
+				database.MarkPositionLost(s.db, pos.ID)
+				result.Losses++
+				continue
+			}
 			utils.Logger.Errorf("Failed to fetch market %s for position #%d: %v", pos.MarketID, pos.ID, err)
 			result.Pending++
 			continue
@@ -935,6 +1023,20 @@ func (s *OracleLagStrategy) CheckAndClaimPositions(ctx context.Context) (*Redemp
 					continue
 				}
 				if !redeemResp.Success {
+					// "No balance for token" means tokens are already gone — either already
+					// redeemed externally or this is a losing position miscategorised as a win.
+					// Stop retrying and close it out rather than spamming every cycle.
+					alreadyGone := strings.Contains(redeemResp.Error, "No balance for token") ||
+						strings.Contains(redeemResp.Error, "no balance") ||
+						strings.Contains(redeemResp.Error, "403") ||
+						strings.Contains(redeemResp.Error, "Forbidden")
+					if alreadyGone {
+						utils.Logger.Warnf("⚠️  Position #%d (%s): tokens already redeemed or no on-chain balance — closing position",
+							pos.ID, pos.MarketQuestion)
+						database.ClaimPosition(s.db, pos.ID, 1.0)
+						result.Wins++ // tokens were already claimed; record as win
+						continue
+					}
 					utils.Logger.Errorf("On-chain redemption rejected for position #%d (%s): %s — will retry next cycle",
 						pos.ID, pos.MarketQuestion, redeemResp.Error)
 					result.Pending++
@@ -956,6 +1058,8 @@ func (s *OracleLagStrategy) CheckAndClaimPositions(ctx context.Context) (*Redemp
 
 			utils.Logger.Infof("🏆 POSITION WON #%d: %s | %s | Profit: $%.2f",
 				pos.ID, pos.MarketQuestion, pos.Outcome, profit)
+
+			go s.recordLearning(pos, true)
 
 			// Send Discord notification
 			if s.config.DiscordWebhookURL != "" {
@@ -990,6 +1094,13 @@ func (s *OracleLagStrategy) CheckAndClaimPositions(ctx context.Context) (*Redemp
 
 			utils.Logger.Infof("❌ POSITION LOST #%d: %s | %s | Loss: -$%.2f",
 				pos.ID, pos.MarketQuestion, pos.Outcome, pos.PositionSize)
+
+			// Notify circuit breaker of the realized loss so daily loss limits are enforced.
+			if err := s.circuitBreaker.RecordTrade(-pos.PositionSize); err != nil {
+				utils.Logger.Errorf("Circuit breaker error after loss: %v", err)
+			}
+
+			go s.recordLearning(pos, false)
 
 			// Send Discord notification
 			if s.config.DiscordWebhookURL != "" {

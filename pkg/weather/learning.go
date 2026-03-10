@@ -3,6 +3,7 @@ package weather
 import (
 	"database/sql"
 	"fmt"
+	"strings"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -112,6 +113,16 @@ func NewLearningDB(dbPath string) (*LearningDB, error) {
 		('boston', 'KBOS', 'America/New_York', 42.3601, -71.0589),
 		('san francisco', 'KSFO', 'America/Los_Angeles', 37.7749, -122.4194);
 	`
+
+	// WAL mode: allows concurrent reads while writing — eliminates SQLITE_BUSY
+	// under the multi-goroutine scan workload.
+	if _, err := db.Exec("PRAGMA journal_mode=WAL"); err != nil {
+		return nil, fmt.Errorf("failed to set WAL mode: %w", err)
+	}
+	// Give blocked writers up to 5 seconds before returning SQLITE_BUSY.
+	if _, err := db.Exec("PRAGMA busy_timeout=5000"); err != nil {
+		return nil, fmt.Errorf("failed to set busy_timeout: %w", err)
+	}
 
 	if _, err := db.Exec(createTablesSQL); err != nil {
 		return nil, fmt.Errorf("failed to create tables: %w", err)
@@ -332,6 +343,41 @@ func (l *LearningDB) GetOptimalEntryByStation(stationCode string) (float64, stri
 	}
 
 	return optimalHour, timezone, nil
+}
+
+// RecordMarketOutcome records the outcome of a resolved market and updates city stats.
+// Called by the bot after a position closes so the learning DB stays current.
+// highTempTime is the local hour when IEM first showed the confirmed high.
+func (l *LearningDB) RecordMarketOutcome(marketID, city, timezone string, date time.Time, highTemp float64, highTempTime time.Time, entryTime time.Time, success bool) error {
+	iemFinalTime := highTempTime.Add(30 * time.Minute) // conservative: IEM finalises ~30m after high
+	optimalEntry := entryTime
+
+	pattern := MarketPattern{
+		MarketID:         marketID,
+		City:             strings.ToLower(city),
+		Date:             date,
+		Timezone:         timezone,
+		HighTemp:         highTemp,
+		HighTempTime:     highTempTime,
+		IEMDataFinalTime: iemFinalTime,
+		MarketResolvedTime: time.Now(),
+		OptimalEntryTime:   optimalEntry,
+		DataLagMinutes:   int(iemFinalTime.Sub(highTempTime).Minutes()),
+		ResolutionLagMinutes: int(time.Now().Sub(iemFinalTime).Minutes()),
+		Success:          success,
+	}
+
+	if err := l.AddMarketPattern(pattern); err != nil {
+		return fmt.Errorf("failed to add market pattern: %w", err)
+	}
+
+	// Recompute city_stats so OptimalEntryHour reflects the new data point
+	if err := l.UpdateCityStats(strings.ToLower(city)); err != nil {
+		// Non-fatal: we recorded the raw data, stats update can retry next time
+		return fmt.Errorf("market pattern saved but city stats update failed: %w", err)
+	}
+
+	return nil
 }
 
 // GetCityByStation looks up city name by station code

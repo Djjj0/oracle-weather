@@ -164,10 +164,33 @@ func (f *Factory) GetIEMResolver() *IEMWeatherResolver {
 	return NewIEMWeatherResolverWithDBs(f.config, f.learningDB, f.intlDB)
 }
 
-// GetAllResolvers returns all available resolvers
+// LearningDBForCity returns the learning DB that covers the given city
+// (US DB first, then international). Returns nil if neither is open.
+func (f *Factory) LearningDBForCity(city string) *pkgweather.LearningDB {
+	cityLC := strings.ToLower(city)
+	if f.learningDB != nil {
+		if _, err := f.learningDB.GetCityStats(cityLC); err == nil {
+			return f.learningDB
+		}
+	}
+	if f.intlDB != nil {
+		if _, err := f.intlDB.GetCityStats(cityLC); err == nil {
+			return f.intlDB
+		}
+	}
+	// Default to US DB (will create a new city record on first write)
+	if f.learningDB != nil {
+		return f.learningDB
+	}
+	return f.intlDB
+}
+
+// GetAllResolvers returns all available resolvers.
+// Uses the factory's pre-opened shared DB connections for the IEM resolver to
+// avoid SQLITE_BUSY from multiple concurrent opens.
 func (f *Factory) GetAllResolvers() []Resolver {
 	return []Resolver{
-		NewIEMWeatherResolver(f.config),
+		NewIEMWeatherResolverWithDBs(f.config, f.learningDB, f.intlDB),
 		NewCryptoResolver(f.config),
 		NewSportsResolver(f.config),
 		NewSoccerResolver(f.config),
