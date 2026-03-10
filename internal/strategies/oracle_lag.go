@@ -381,7 +381,7 @@ func (s *OracleLagStrategy) ScanOpportunities(ctx context.Context) (<-chan Oppor
 				}
 
 				if outcome == nil {
-					utils.Logger.Infof("SKIP [not_resolvable] %q via %s: data not yet available", m.Question, resolverName)
+					utils.Logger.Debugf("SKIP [not_resolvable] %q via %s: not yet actionable (waiting for peak hour or insufficient data)", m.Question, resolverName)
 					localSkip("not_resolvable")
 					return
 				}
