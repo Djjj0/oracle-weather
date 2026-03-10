@@ -432,9 +432,12 @@ func (w *IEMWeatherResolver) checkObviousNo(data *MarketData, runningHigh float6
 func (w *IEMWeatherResolver) determineOutcomeWithPeak(data *MarketData, runningHigh float64, unitSymbol string, currentHour, typicalPeakHour float64) (string, float64) {
 	roundedHigh := math.Round(runningHigh)
 
-	// Add 1 hour buffer past typical peak before allowing NO bets
-	// (gives IEM time to record the actual peak observation)
+	// pastPeak (+1h): gate for NO bets and range/below YES bets.
+	// earlyPeak (+0.5h): gate for exact-match YES bets — temp has been stable
+	// long enough to be confident, but we don't need the full 1h.
+	// Both give IEM time to record the actual peak observation.
 	pastPeak := currentHour >= typicalPeakHour+1.0
+	earlyPeak := currentHour >= typicalPeakHour+0.5
 
 	switch data.Condition {
 	case "temperature_above":
@@ -473,12 +476,12 @@ func (w *IEMWeatherResolver) determineOutcomeWithPeak(data *MarketData, runningH
 		if roundedHigh > data.Threshold {
 			return "No", marginToConfidence(runningHigh - data.Threshold)
 		}
-		if pastPeak {
+		if earlyPeak {
 			if roundedHigh == data.Threshold {
-				// Past peak and running high matches exactly — bet YES.
-				// The high has hit this value and we're past the peak so it's
-				// unlikely to go higher. Small bonus for each extra hour past peak.
-				peakMarginBonus := math.Min((currentHour-typicalPeakHour-1.0)*0.05, 0.10)
+				// Past early-peak and running high matches exactly — bet YES.
+				// earlyPeak (+0.5h) is sufficient: temp has settled and won't
+				// climb further in the next 30 minutes. Use pastPeak bonus.
+				peakMarginBonus := math.Min((currentHour-typicalPeakHour-0.5)*0.05, 0.10)
 				return "Yes", math.Min(0.80+peakMarginBonus, 0.92)
 			}
 			// Past peak and still below — won't reach exact value, bet NO.
