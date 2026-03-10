@@ -544,62 +544,76 @@ func (c *PolymarketClientLixv) getMarkets(closedStatus string) ([]Market, error)
 	return allMarkets, nil
 }
 
-// GetWeatherMarkets fetches temperature markets by scanning from the known offset
-// where they live in the Gamma API (~25000). This avoids paginating all 30k+ markets
-// and is resilient to Polymarket's HTTP/2 GOAWAY errors at high offsets.
-func (c *PolymarketClientLixv) GetWeatherMarkets() ([]Market, error) {
-	const pageSize = 500
-	// Temperature markets consistently appear around offset 24500-25500.
-	// Scan a window of ±2000 around that to handle drift over time.
-	const startOffset = 23000
-	const maxOffset = 27000
-	var allMarkets []Market
+// weatherEvent is a minimal struct for decoding the /events response.
+// Each event contains a nested slice of markets.
+type weatherEvent struct {
+	Title   string   `json:"title"`
+	Markets []Market `json:"markets"`
+}
 
-	for offset := startOffset; offset <= maxOffset; offset += pageSize {
+// GetWeatherMarkets fetches weather/temperature markets via the Gamma API's
+// /events endpoint filtered by tag_slug=weather. This is robust against market
+// offset drift (the old /markets?offset approach was brittle — weather markets
+// drift as new markets are added and the hardcoded offset window becomes stale).
+func (c *PolymarketClientLixv) GetWeatherMarkets() ([]Market, error) {
+	const pageSize = 100 // events per page (each event has ~5-10 markets)
+	var allMarkets []Market
+	seen := make(map[string]struct{})
+
+	for offset := 0; ; offset += pageSize {
 		c.rateLimiter.Wait(context.Background())
 
-		var page []Market
+		var events []weatherEvent
 		resp, err := c.gammaClient.R().
-			SetResult(&page).
+			SetResult(&events).
 			SetQueryParam("closed", "false").
 			SetQueryParam("limit", fmt.Sprintf("%d", pageSize)).
 			SetQueryParam("offset", fmt.Sprintf("%d", offset)).
-			Get("/markets")
+			SetQueryParam("tag_slug", "weather").
+			Get("/events")
 
 		if err != nil {
-			utils.Logger.Warnf("Weather market fetch error at offset %d: %v", offset, err)
+			utils.Logger.Warnf("Weather events fetch error at offset %d: %v", offset, err)
 			break
 		}
 		if resp.IsError() {
-			utils.Logger.Warnf("Weather market API error at offset %d: %s", offset, resp.Status())
+			utils.Logger.Warnf("Weather events API error at offset %d: %s", offset, resp.Status())
 			break
 		}
-		if len(page) == 0 {
+		if len(events) == 0 {
 			break
 		}
 
-		allMarkets = append(allMarkets, page...)
+		fetchTime := time.Now()
+		for _, event := range events {
+			for i := range event.Markets {
+				m := event.Markets[i]
+				// Deduplicate (a market can appear in multiple events)
+				if _, exists := seen[m.ID]; exists {
+					continue
+				}
+				seen[m.ID] = struct{}{}
 
-		if len(page) < pageSize {
-			break
+				m.FetchedAt = fetchTime
+				if m.OutcomesStr != "" {
+					m.Outcomes = parseJSONStringArray(m.OutcomesStr)
+				}
+				if m.TokenIDsStr != "" {
+					m.TokenIDs = parseJSONStringArray(m.TokenIDsStr)
+				}
+				if m.OutcomePricesStr != "" {
+					m.Prices = parseOutcomePrices(m.OutcomePricesStr)
+				}
+				allMarkets = append(allMarkets, m)
+			}
+		}
+
+		if len(events) < pageSize {
+			break // last page
 		}
 	}
 
-	fetchTime := time.Now()
-	for i := range allMarkets {
-		allMarkets[i].FetchedAt = fetchTime
-		if allMarkets[i].OutcomesStr != "" {
-			allMarkets[i].Outcomes = parseJSONStringArray(allMarkets[i].OutcomesStr)
-		}
-		if allMarkets[i].TokenIDsStr != "" {
-			allMarkets[i].TokenIDs = parseJSONStringArray(allMarkets[i].TokenIDsStr)
-		}
-		if allMarkets[i].OutcomePricesStr != "" {
-			allMarkets[i].Prices = parseOutcomePrices(allMarkets[i].OutcomePricesStr)
-		}
-	}
-
-	utils.Logger.Infof("GetWeatherMarkets: fetched %d markets from offsets %d-%d", len(allMarkets), startOffset, maxOffset)
+	utils.Logger.Infof("GetWeatherMarkets: fetched %d unique markets from weather events", len(allMarkets))
 	return allMarkets, nil
 }
 
