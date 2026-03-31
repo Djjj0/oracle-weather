@@ -534,9 +534,11 @@ func (w *IEMWeatherResolver) getIEMHighTemp(station string, date time.Time, cels
 	utcDate := date.UTC()
 	tzName := loc.String()
 
-	// IEM ASOS API endpoint — tz param makes IEM interpret dates in local time
+	// IEM ASOS API endpoint — tz param makes IEM interpret dates in local time.
+	// report_type=METAR filters server-side to standard hourly observations only,
+	// dropping SPECI (special/high-frequency) rows that WU does not use.
 	url := fmt.Sprintf(
-		"https://mesonet.agron.iastate.edu/cgi-bin/request/asos.py?station=%s&data=tmpf&year1=%d&month1=%d&day1=%d&year2=%d&month2=%d&day2=%d&tz=%s&format=onlycomma&latlon=no&elev=no&missing=null&trace=null&direct=no&report_type=3&report_type=4",
+		"https://mesonet.agron.iastate.edu/cgi-bin/request/asos.py?station=%s&data=tmpf,report_type&year1=%d&month1=%d&day1=%d&year2=%d&month2=%d&day2=%d&tz=%s&format=onlycomma&latlon=no&elev=no&missing=M&trace=T&direct=no&report_type=METAR",
 		station,
 		utcDate.Year(), int(utcDate.Month()), utcDate.Day(),
 		utcDate.Year(), int(utcDate.Month()), utcDate.Day(),
@@ -558,17 +560,24 @@ func (w *IEMWeatherResolver) getIEMHighTemp(station string, date time.Time, cels
 		return 0, 0, fmt.Errorf("no data returned from IEM for station %s on %s", station, date.Format("2006-01-02"))
 	}
 
-	// Extract temperatures from CSV (skip header)
+	// Extract temperatures from CSV (skip header).
+	// Columns: station, valid, tmpf, report_type
+	// Belt-and-braces METAR guard — server-side filter should already exclude SPECI.
 	var temps []float64
 	for _, line := range lines[1:] {
 		parts := strings.Split(line, ",")
-		if len(parts) < 3 {
+		if len(parts) < 4 {
+			continue
+		}
+
+		// Drop any non-METAR rows that slip through
+		if strings.TrimSpace(parts[3]) != "METAR" {
 			continue
 		}
 
 		// Temperature is in 3rd column (index 2)
 		tempStr := strings.TrimSpace(parts[2])
-		if tempStr == "" || tempStr == "null" || tempStr == "M" {
+		if tempStr == "" || tempStr == "M" || tempStr == "T" || tempStr == "null" {
 			continue
 		}
 

@@ -43,6 +43,12 @@ type BaseResolver struct {
 	confidence float64
 }
 
+// CachedResult stores a resolved outcome and its confidence score.
+type CachedResult struct {
+	Outcome    string
+	Confidence float64
+}
+
 // GetConfidence returns the confidence level
 func (b *BaseResolver) GetConfidence() float64 {
 	return b.confidence

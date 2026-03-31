@@ -126,6 +126,60 @@ func PlaceMarketOrderPython(ctx context.Context, tokenID string, price, size flo
 	return nil
 }
 
+// RedeemPositionViaPython redeems a resolved winning position on-chain via
+// scripts/redeem_position.py. Input: token ID and outcome ("Yes"/"No").
+func RedeemPositionViaPython(ctx context.Context, tokenID, outcome string) (*PythonOrderResponse, error) {
+	type redeemRequest struct {
+		TokenID string `json:"token_id"`
+		Outcome string `json:"outcome"`
+	}
+	reqJSON, err := json.Marshal(redeemRequest{TokenID: tokenID, Outcome: outcome})
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal redeem request: %w", err)
+	}
+
+	exePath, _ := filepath.Abs(filepath.Join("scripts", "redeem_position.py"))
+
+	pythonExe := "python"
+	if path, err := exec.LookPath("python"); err == nil {
+		pythonExe = path
+	} else if path, err := exec.LookPath("python3"); err == nil {
+		pythonExe = path
+	}
+
+	cmdCtx, cancel := context.WithTimeout(ctx, 90*time.Second)
+	defer cancel()
+
+	cmd := exec.CommandContext(cmdCtx, pythonExe, exePath, string(reqJSON))
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+
+	start := time.Now()
+	_ = cmd.Run()
+	duration := time.Since(start)
+
+	var response PythonOrderResponse
+	if stdout.Len() > 0 {
+		if err := json.Unmarshal(stdout.Bytes(), &response); err != nil {
+			return nil, fmt.Errorf("failed to parse redeem response: %w (output: %s)", err, stdout.String())
+		}
+	} else {
+		if stderr.Len() > 0 {
+			utils.Logger.Errorf("Redeem script stderr: %s", stderr.String())
+		}
+		return nil, fmt.Errorf("redeem script produced no output (python=%s, script=%s)", pythonExe, exePath)
+	}
+
+	if response.Success {
+		utils.Logger.Infof("✅ Position redeemed via Python (%.0fms): token=%s outcome=%s", duration.Milliseconds(), tokenID, outcome)
+	} else {
+		utils.Logger.Warnf("Redeem failed (%.0fms): %s", duration.Milliseconds(), response.Error)
+	}
+
+	return &response, nil
+}
+
 // PlaceSellOrderPython is a convenience wrapper for sell orders
 func PlaceSellOrderPython(ctx context.Context, tokenID string, price, size float64) error {
 	resp, err := PlaceOrderViaPython(ctx, tokenID, price, size, "SELL")

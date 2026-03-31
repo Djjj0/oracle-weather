@@ -375,7 +375,11 @@ func (s *OracleLagStrategy) ScanOpportunities(ctx context.Context) (<-chan Oppor
 				// Check if market can be resolved
 				outcome, confidence, err := resolver.CheckResolution(m)
 				if err != nil {
-					utils.Logger.Infof("SKIP [resolution_error] %q via %s: %v", m.Question, resolverName, err)
+					if strings.Contains(err.Error(), "could not parse") {
+						utils.Logger.Debugf("SKIP [resolution_error] %q via %s: %v", m.Question, resolverName, err)
+					} else {
+						utils.Logger.Infof("SKIP [resolution_error] %q via %s: %v", m.Question, resolverName, err)
+					}
 					localSkip("resolution_error")
 					return
 				}

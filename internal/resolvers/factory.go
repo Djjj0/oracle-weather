@@ -34,25 +34,14 @@ func NewFactory(cfg *config.Config) *Factory {
 	}
 }
 
-// GetResolver returns the appropriate resolver for a market category
+// GetResolver returns the appropriate resolver for a market category.
+// Only weather markets are supported — all other categories return nil.
 func (f *Factory) GetResolver(marketCategory string) Resolver {
 	category := strings.ToLower(marketCategory)
-
-	switch category {
-	case "weather":
-		// Don't trust the category tag alone — Polymarket sometimes tags non-weather
-		// markets as "weather". Let caller fall through to GetResolverByQuestion.
-		return nil
-	case "crypto", "cryptocurrency":
-		return NewCryptoResolver(f.config)
-	case "sports":
-		return NewSportsResolver(f.config)
-	case "soccer", "football":
-		return NewSoccerResolver(f.config)
-	default:
-		// Try to auto-detect from category name
-		return f.autoDetectResolver(category)
+	if strings.Contains(category, "weather") || strings.Contains(category, "climate") {
+		return NewIEMWeatherResolverWithDBs(f.config, f.learningDB, f.intlDB)
 	}
+	return nil
 }
 
 // containsWord checks if a question contains a keyword as a whole word (not a substring).
@@ -80,80 +69,16 @@ func containsWord(question, keyword string) bool {
 	return true
 }
 
-// GetResolverByQuestion auto-detects category from the question text
+// GetResolverByQuestion auto-detects the resolver from the question text.
+// Only weather questions are supported.
 func (f *Factory) GetResolverByQuestion(question string) Resolver {
 	question = strings.ToLower(question)
 
-	// Weather keywords — use word-boundary check to avoid false positives
-	// e.g. "rain" in "Rainbow" or "snow" in "Snowflake"
 	weatherKeywords := []string{"rain", "temperature", "snow", "weather", "sunny", "cloudy"}
 	for _, keyword := range weatherKeywords {
 		if containsWord(question, keyword) {
 			return NewIEMWeatherResolverWithDBs(f.config, f.learningDB, f.intlDB)
 		}
-	}
-
-	// Crypto keywords (removed "price" and "doge" - too many false positives)
-	// Note: "doge" matches "DOGE" (Department of Government Efficiency)
-	cryptoKeywords := []string{"btc", "bitcoin", "eth", "ethereum", "crypto", "sol", "solana", "cardano", "ada", "dogecoin"}
-	for _, keyword := range cryptoKeywords {
-		if strings.Contains(question, keyword) {
-			return NewCryptoResolver(f.config)
-		}
-	}
-
-	// Special case: only match "price" if crypto coin is mentioned
-	if strings.Contains(question, "price") {
-		for _, coin := range []string{"btc", "bitcoin", "eth", "ethereum", "sol", "crypto"} {
-			if strings.Contains(question, coin) {
-				return NewCryptoResolver(f.config)
-			}
-		}
-	}
-
-	// Soccer keywords (HUGE category on Polymarket - Champions League, FIFA, etc.)
-	soccerKeywords := []string{"advance to", "champions league", "uefa", "fifa", "real madrid", "barcelona",
-		"liverpool", "manchester", "bayern", "psg", "juventus", "milan", "chelsea", "arsenal"}
-	for _, keyword := range soccerKeywords {
-		if strings.Contains(question, keyword) {
-			return NewSoccerResolver(f.config)
-		}
-	}
-
-	// US Sports keywords (NBA, NFL, etc.)
-	sportsKeywords := []string{"beat", "win", "score", "game", "lakers", "celtics", "patriots", "nba", "nfl", "mlb", "nhl"}
-	for _, keyword := range sportsKeywords {
-		if strings.Contains(question, keyword) {
-			return NewSportsResolver(f.config)
-		}
-	}
-
-	// Default to nil - can't determine
-	return nil
-}
-
-// autoDetectResolver tries to detect resolver from category string
-func (f *Factory) autoDetectResolver(category string) Resolver {
-	// Check for weather-related categories
-	if strings.Contains(category, "weather") || strings.Contains(category, "climate") {
-		return NewIEMWeatherResolverWithDBs(f.config, f.learningDB, f.intlDB)
-	}
-
-	// Check for crypto-related categories
-	if strings.Contains(category, "crypto") || strings.Contains(category, "blockchain") {
-		return NewCryptoResolver(f.config)
-	}
-
-	// Check for soccer-related categories
-	if strings.Contains(category, "soccer") || strings.Contains(category, "football") ||
-	   strings.Contains(category, "uefa") || strings.Contains(category, "fifa") {
-		return NewSoccerResolver(f.config)
-	}
-
-	// Check for sports-related categories (US sports)
-	if strings.Contains(category, "sport") || strings.Contains(category, "nba") ||
-	   strings.Contains(category, "nfl") || strings.Contains(category, "mlb") {
-		return NewSportsResolver(f.config)
 	}
 
 	return nil
@@ -186,13 +111,8 @@ func (f *Factory) LearningDBForCity(city string) *pkgweather.LearningDB {
 }
 
 // GetAllResolvers returns all available resolvers.
-// Uses the factory's pre-opened shared DB connections for the IEM resolver to
-// avoid SQLITE_BUSY from multiple concurrent opens.
 func (f *Factory) GetAllResolvers() []Resolver {
 	return []Resolver{
 		NewIEMWeatherResolverWithDBs(f.config, f.learningDB, f.intlDB),
-		NewCryptoResolver(f.config),
-		NewSportsResolver(f.config),
-		NewSoccerResolver(f.config),
 	}
 }

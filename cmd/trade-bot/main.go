@@ -128,7 +128,7 @@ func runOracleLagStrategy(ctx context.Context, strategy *strategies.OracleLagStr
 }
 
 func runPositionClaimer(ctx context.Context, strategy *strategies.OracleLagStrategy, logger *logrus.Logger) {
-	ticker := time.NewTicker(5 * time.Minute)
+	ticker := time.NewTicker(1 * time.Hour)
 	defer ticker.Stop()
 
 	runCycle := func() {
