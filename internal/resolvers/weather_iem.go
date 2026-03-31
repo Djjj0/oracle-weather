@@ -89,6 +89,7 @@ var cityToAirport = map[string]string{
 	"tampa":          "KTPA",
 	"orlando":        "KMCO",
 	"kansas city":    "KMCI",
+	"mexico city":    "MMMX", // Benito Juárez Intl
 	"buenos aires":   "SAEZ", // Ezeiza
 	"seoul":          "RKSI", // Incheon
 	"toronto":        "CYYZ", // Pearson
@@ -535,10 +536,10 @@ func (w *IEMWeatherResolver) getIEMHighTemp(station string, date time.Time, cels
 	tzName := loc.String()
 
 	// IEM ASOS API endpoint — tz param makes IEM interpret dates in local time.
-	// report_type=METAR filters server-side to standard hourly observations only,
-	// dropping SPECI (special/high-frequency) rows that WU does not use.
+	// report_type=3 (routine METAR) and report_type=4 (SPECI) are the valid numeric
+	// codes. We request both and filter SPECI client-side via the report_type column.
 	url := fmt.Sprintf(
-		"https://mesonet.agron.iastate.edu/cgi-bin/request/asos.py?station=%s&data=tmpf,report_type&year1=%d&month1=%d&day1=%d&year2=%d&month2=%d&day2=%d&tz=%s&format=onlycomma&latlon=no&elev=no&missing=M&trace=T&direct=no&report_type=METAR",
+		"https://mesonet.agron.iastate.edu/cgi-bin/request/asos.py?station=%s&data=tmpf,report_type&year1=%d&month1=%d&day1=%d&year2=%d&month2=%d&day2=%d&tz=%s&format=onlycomma&latlon=no&elev=no&missing=M&trace=T&direct=no&report_type=3&report_type=4",
 		station,
 		utcDate.Year(), int(utcDate.Month()), utcDate.Day(),
 		utcDate.Year(), int(utcDate.Month()), utcDate.Day(),
@@ -570,8 +571,8 @@ func (w *IEMWeatherResolver) getIEMHighTemp(station string, date time.Time, cels
 			continue
 		}
 
-		// Drop any non-METAR rows that slip through
-		if strings.TrimSpace(parts[3]) != "METAR" {
+		// Drop SPECI (report_type=4) — only keep routine METAR (report_type=3)
+		if strings.TrimSpace(parts[3]) != "3" {
 			continue
 		}
 
