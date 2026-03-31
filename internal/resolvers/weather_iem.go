@@ -126,6 +126,45 @@ var cityToAirport = map[string]string{
 	"ankara":         "LTAC", // Esenboğa Intl
 	"sao paulo":      "SBGR", // Guarulhos Intl
 	"wellington":     "NZWN", // Wellington Intl
+	// Middle East
+	"tel aviv":       "LLBG", // Ben Gurion International
+	"istanbul":       "LTBA", // Atatürk International (WU reference station)
+	"riyadh":         "OERK", // King Khalid International
+	"doha":           "OTHH", // Hamad International
+	"kuwait city":    "OKBK", // Kuwait International
+	// Africa
+	"cairo":          "HECA", // Cairo International
+	"johannesburg":   "FAOR", // O.R. Tambo International
+	"cape town":      "FACT", // Cape Town International
+	"lagos":          "DNMM", // Murtala Muhammed International
+	"nairobi":        "HKJK", // Jomo Kenyatta International
+	"casablanca":     "GMMN", // Mohammed V International
+	// South / Southeast Asia
+	"karachi":        "OPKC", // Jinnah International
+	"lahore":         "OPLA", // Allama Iqbal International
+	"chennai":        "VOMM", // Chennai International
+	"kolkata":        "VECC", // Netaji Subhas Chandra Bose International
+	"hyderabad":      "VOHS", // Rajiv Gandhi International
+	"bangalore":      "VOBL", // Kempegowda International
+	"bangkok":        "VTBS", // Suvarnabhumi
+	"jakarta":        "WIII", // Soekarno-Hatta
+	"manila":         "RPLL", // Ninoy Aquino International
+	"ho chi minh city": "VVTS", // Tan Son Nhat
+	"kuala lumpur":   "WMKK", // Kuala Lumpur International
+	// East Asia
+	"taipei":         "RCTP", // Taiwan Taoyuan International
+	"osaka":          "RJBB", // Kansai International
+	// Europe (additions)
+	"frankfurt":      "EDDF", // Frankfurt Airport
+	// Latin America
+	"lima":           "SPJC", // Jorge Chávez International
+	"bogota":         "SKBO", // El Dorado International
+	"santiago":       "SCEL", // Arturo Merino Benítez International
+	"caracas":        "SVMI", // Simón Bolívar International
+	"guadalajara":    "MMGL", // Miguel Hidalgo International
+	"monterrey":      "MMMY", // General Mariano Escobedo International
+	"havana":         "MUHA", // José Martí International
+	"san juan":       "TJSJ", // Luis Muñoz Marín International
 }
 
 // CheckResolution checks weather using IEM ASOS data.
@@ -172,7 +211,8 @@ func (w *IEMWeatherResolver) CheckResolution(market polymarket.Market) (*string,
 	// Get airport code
 	airportCode, ok := cityToAirport[strings.ToLower(data.Location)]
 	if !ok {
-		return nil, 0, fmt.Errorf("unknown city (no airport mapping): %s", data.Location)
+		utils.Logger.Debugf("IEM: no airport mapping for city %q — skipping", data.Location)
+		return nil, 0, nil
 	}
 
 	useCelsius := false
@@ -389,6 +429,45 @@ func cityDefaultPeakHour(city string) float64 {
 		"sydney":     15.0,
 		"melbourne":  15.0,
 		"wellington": 14.0, // windy, maritime
+		// Middle East
+		"tel aviv":    15.0, // Mediterranean coast
+		"istanbul":    15.0,
+		"riyadh":      15.0, // desert
+		"doha":        15.0, // desert
+		"kuwait city": 15.0, // desert
+		// Africa
+		"cairo":         15.0, // desert
+		"johannesburg":  15.0,
+		"cape town":     15.0,
+		"lagos":         14.0, // tropical coastal
+		"nairobi":       14.0, // equatorial highland
+		"casablanca":    15.0, // coastal Mediterranean
+		// South / Southeast Asia
+		"karachi":          15.0,
+		"lahore":           15.0,
+		"chennai":          14.0, // coastal tropical
+		"kolkata":          14.0,
+		"hyderabad":        15.0,
+		"bangalore":        14.0,
+		"bangkok":          13.0, // tropical — peaks early before afternoon storms
+		"jakarta":          13.0, // equatorial
+		"manila":           13.0, // tropical
+		"ho chi minh city": 13.0, // tropical
+		"kuala lumpur":     13.0, // equatorial
+		// East Asia
+		"taipei": 14.0,
+		"osaka":  14.0, // same as Tokyo
+		// Latin America
+		"lima":        14.0, // coastal, low cloud
+		"bogota":      14.0, // high altitude equatorial
+		"santiago":    15.0,
+		"caracas":     14.0,
+		"guadalajara": 15.0,
+		"monterrey":   15.0,
+		"havana":      14.0, // tropical
+		"san juan":    14.0, // tropical
+		// Mexico
+		"mexico city": 15.0,
 	}
 	if h, ok := defaults[city]; ok {
 		return h

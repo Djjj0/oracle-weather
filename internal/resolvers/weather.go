@@ -98,6 +98,44 @@ var cityTimezones = map[string]string{
 	"ankara":       "Europe/Istanbul",
 	"sao paulo":    "America/Sao_Paulo",
 	"wellington":   "Pacific/Auckland",
+	"mexico city":  "America/Mexico_City",
+	// Middle East
+	"tel aviv":     "Asia/Jerusalem",
+	"istanbul":     "Europe/Istanbul",
+	"riyadh":       "Asia/Riyadh",
+	"doha":         "Asia/Qatar",
+	"kuwait city":  "Asia/Kuwait",
+	// Africa
+	"cairo":        "Africa/Cairo",
+	"johannesburg": "Africa/Johannesburg",
+	"cape town":    "Africa/Johannesburg",
+	"lagos":        "Africa/Lagos",
+	"nairobi":      "Africa/Nairobi",
+	"casablanca":   "Africa/Casablanca",
+	// South / Southeast Asia
+	"karachi":          "Asia/Karachi",
+	"lahore":           "Asia/Karachi",
+	"chennai":          "Asia/Kolkata",
+	"kolkata":          "Asia/Kolkata",
+	"hyderabad":        "Asia/Kolkata",
+	"bangalore":        "Asia/Kolkata",
+	"bangkok":          "Asia/Bangkok",
+	"jakarta":          "Asia/Jakarta",
+	"manila":           "Asia/Manila",
+	"ho chi minh city": "Asia/Ho_Chi_Minh",
+	"kuala lumpur":     "Asia/Kuala_Lumpur",
+	// East Asia
+	"taipei": "Asia/Taipei",
+	"osaka":  "Asia/Tokyo",
+	// Latin America
+	"lima":        "America/Lima",
+	"bogota":      "America/Bogota",
+	"santiago":    "America/Santiago",
+	"caracas":     "America/Caracas",
+	"guadalajara": "America/Mexico_City",
+	"monterrey":   "America/Monterrey",
+	"havana":      "America/Havana",
+	"san juan":    "America/Puerto_Rico",
 }
 
 // getTimezone returns the IANA timezone string for a city
