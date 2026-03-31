@@ -267,7 +267,8 @@ func (w *IEMWeatherResolver) CheckResolution(market polymarket.Market) (*string,
 		effectiveMinObs = minObsLateDay
 	}
 	if obsCount < effectiveMinObs {
-		return nil, 0, fmt.Errorf("data not yet available (only %d observations so far today, need %d)", obsCount, effectiveMinObs)
+		utils.Logger.Debugf("⏳ Not enough observations yet: %s on %s (%d/%d)", data.Location, data.Date.Format("2006-01-02"), obsCount, effectiveMinObs)
+		return nil, 0, nil
 	}
 
 	outcome, confidence := w.determineOutcomeWithPeak(data, runningHigh, unitSymbol, currentHour, typicalPeakHour)
@@ -558,7 +559,8 @@ func (w *IEMWeatherResolver) getIEMHighTemp(station string, date time.Time, cels
 	// Parse CSV response
 	lines := strings.Split(strings.TrimSpace(resp.String()), "\n")
 	if len(lines) < 2 {
-		return 0, 0, fmt.Errorf("no data returned from IEM for station %s on %s", station, date.Format("2006-01-02"))
+		// No observations yet — local day may not have started. Treat as not ready.
+		return 0, 0, nil
 	}
 
 	// Extract temperatures from CSV (skip header).
@@ -571,8 +573,9 @@ func (w *IEMWeatherResolver) getIEMHighTemp(station string, date time.Time, cels
 			continue
 		}
 
-		// Drop SPECI (report_type=4) — only keep routine METAR (report_type=3)
-		if strings.TrimSpace(parts[3]) != "3" {
+		// Drop SPECI (report_type=4) only — international stations may use
+		// codes other than "3", so we allow anything that isn't an explicit SPECI.
+		if strings.TrimSpace(parts[3]) == "4" {
 			continue
 		}
 
@@ -594,7 +597,8 @@ func (w *IEMWeatherResolver) getIEMHighTemp(station string, date time.Time, cels
 	}
 
 	if len(temps) == 0 {
-		return 0, 0, fmt.Errorf("no valid temperature readings for %s on %s", station, date.Format("2006-01-02"))
+		// All rows filtered (e.g. all SPECI) or station not reporting yet.
+		return 0, 0, nil
 	}
 
 	// Get daily high (max temperature)
