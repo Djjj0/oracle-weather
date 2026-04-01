@@ -32,6 +32,8 @@ const (
 	ReEntryHardLimit = 4 * time.Hour
 	// Re-entry position size multiplier (50% of normal size)
 	ReEntryPositionMultiplier = 0.5
+	// SlippageBuffer accounts for estimated price impact of a market buy order
+	SlippageBuffer = 0.05
 )
 
 // tradeRecord stores metadata about a trade for re-entry tracking
@@ -116,7 +118,8 @@ type ScanResult struct {
 	Opportunities  int
 	Executed       int
 	Skipped        int
-	SkipReasons    map[string]int // reason -> count
+	SkipReasons    map[string]int            // reason -> count
+	SkipByCity     map[string]map[string]int // city -> reason -> count
 }
 
 // Opportunity represents a trading opportunity
@@ -143,6 +146,18 @@ type TemperatureBucket struct {
 	HighTemp  float64
 	IsRange   bool // true for "48-49°F", false for "50°F or higher"
 	MarketID  string
+}
+
+// cityQuestionRe extracts city name from weather market questions.
+var cityQuestionRe = regexp.MustCompile(`(?i)in ([A-Za-z\s]+?) (?:be|on)`)
+
+// extractCityFromQuestion returns the lowercase city name from a market question,
+// or "" if the pattern doesn't match.
+func extractCityFromQuestion(question string) string {
+	if m := cityQuestionRe.FindStringSubmatch(question); len(m) > 1 {
+		return strings.ToLower(strings.TrimSpace(m[1]))
+	}
+	return ""
 }
 
 // parseBucketFromQuestion extracts temperature bucket info from market question
@@ -299,6 +314,7 @@ func (s *OracleLagStrategy) ScanOpportunities(ctx context.Context) (<-chan Oppor
 
 		result := ScanResult{
 			SkipReasons: make(map[string]int),
+			SkipByCity:  make(map[string]map[string]int),
 		}
 		// Check circuit breaker first
 		canTrade, reason := s.circuitBreaker.CanTrade()
@@ -358,6 +374,12 @@ func (s *OracleLagStrategy) ScanOpportunities(ctx context.Context) (<-chan Oppor
 					resultMu.Lock()
 					result.Skipped++
 					result.SkipReasons[reason]++
+					if city := extractCityFromQuestion(m.Question); city != "" {
+						if result.SkipByCity[city] == nil {
+							result.SkipByCity[city] = make(map[string]int)
+						}
+						result.SkipByCity[city][reason]++
+					}
 					resultMu.Unlock()
 				}
 
@@ -420,14 +442,27 @@ func (s *OracleLagStrategy) ScanOpportunities(ctx context.Context) (<-chan Oppor
 					return
 				}
 
+				// Skip markets >2h past resolution still priced near 50/50 — broken/stuck market.
+				staleCutoff := m.ResolutionTimestamp.Add(2 * time.Hour)
+				if time.Now().After(staleCutoff) {
+					const staleLow = 0.40
+					const staleHigh = 0.60
+					if yesPrice >= staleLow && yesPrice <= staleHigh &&
+						noPrice >= staleLow && noPrice <= staleHigh {
+						utils.Logger.Infof("SKIP [stale_market] %q: resolution+2h passed, prices still near 50/50 (YES=$%.2f NO=$%.2f)", m.Question, yesPrice, noPrice)
+						localSkip("stale_market")
+						return
+					}
+				}
+
 				bestOutcome := *outcome
 				var bestPrice, bestEdge float64
 				if bestOutcome == "Yes" {
 					bestPrice = yesPrice
-					bestEdge = confidence - yesPrice
+					bestEdge = confidence - yesPrice - SlippageBuffer
 				} else {
 					bestPrice = noPrice
-					bestEdge = confidence - noPrice
+					bestEdge = confidence - noPrice - SlippageBuffer
 				}
 
 				dynamicThreshold := s.getDynamicThreshold()
@@ -504,6 +539,14 @@ func (s *OracleLagStrategy) ScanOpportunities(ctx context.Context) (<-chan Oppor
 			utils.Logger.Info("Skip reason breakdown:")
 			for reason, count := range result.SkipReasons {
 				utils.Logger.Infof("  %-40s %d", reason, count)
+			}
+		}
+		if result.SkipReasons["dead_market"] > 0 {
+			utils.Logger.Debugf("Dead market breakdown by city:")
+			for city, reasons := range result.SkipByCity {
+				if count := reasons["dead_market"]; count > 0 {
+					utils.Logger.Debugf("  %-20s dead=%d not_resolvable=%d low_edge=%d", city, count, reasons["not_resolvable"], reasons["low_edge"])
+				}
 			}
 		}
 

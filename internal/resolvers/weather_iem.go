@@ -287,7 +287,16 @@ func (w *IEMWeatherResolver) CheckResolution(market polymarket.Market) (*string,
 	// Returns -1 if no data — skip the market until backfill runs.
 	typicalPeakHour := w.getTypicalPeakHour(data.Location)
 	if typicalPeakHour < 0 {
-		return nil, 0, nil
+		// No learning DB data — try live on-demand IEM lookup for last 5 days.
+		targetDB := w.learningDB
+		if targetDB == nil {
+			targetDB = w.intlDB
+		}
+		typicalPeakHour = w.fetchOnDemandPeakHour(data.Location, airportCode, loc.String(), targetDB)
+		if typicalPeakHour < 0 {
+			utils.Logger.Debugf("IEM: on-demand peak hour lookup failed for %q — skipping", data.Location)
+			return nil, 0, nil
+		}
 	}
 
 	// Check for an obvious NO: running high already clearly exceeds a ceiling threshold.
@@ -350,6 +359,56 @@ func (w *IEMWeatherResolver) getTypicalPeakHour(city string) float64 {
 	return -1
 }
 
+
+// fetchOnDemandPeakHour queries IEM for the last 5 days for a station, computes
+// the average peak hour, stores the records in the learning DB, and returns the
+// computed peak hour. Returns -1 if insufficient data could be fetched.
+func (w *IEMWeatherResolver) fetchOnDemandPeakHour(city, station, timezone string, db *pkgweather.LearningDB) float64 {
+	if db == nil {
+		return -1
+	}
+	loc, err := time.LoadLocation(timezone)
+	if err != nil {
+		utils.Logger.Warnf("IEM on-demand: bad timezone %q for %s: %v", timezone, city, err)
+		return -1
+	}
+
+	now := time.Now().UTC()
+	var peakHours []float64
+	for i := 1; i <= 5; i++ {
+		date := now.AddDate(0, 0, -i)
+		peakHour, peakTemp, err := pkgweather.FetchDailyPeak(station, date, loc)
+		if err != nil {
+			continue
+		}
+		localDate := date.In(loc)
+		peakHourInt := int(peakHour)
+		peakMin := int((peakHour - float64(peakHourInt)) * 60)
+		highTempTime := time.Date(localDate.Year(), localDate.Month(), localDate.Day(),
+			peakHourInt, peakMin, 0, 0, loc)
+		marketID := fmt.Sprintf("ondemand_%s_%s", station, date.UTC().Format("2006-01-02"))
+		if err := db.RecordMarketOutcome(
+			marketID, strings.ToLower(city), timezone,
+			date, peakTemp, highTempTime, highTempTime.Add(time.Hour), true,
+		); err != nil && !strings.Contains(err.Error(), "UNIQUE") {
+			utils.Logger.Warnf("IEM on-demand: DB write error for %s: %v", city, err)
+		}
+		peakHours = append(peakHours, peakHour)
+	}
+
+	if len(peakHours) == 0 {
+		utils.Logger.Warnf("IEM on-demand: no data fetched for %s (%s)", city, station)
+		return -1
+	}
+
+	var sum float64
+	for _, h := range peakHours {
+		sum += h
+	}
+	computed := sum / float64(len(peakHours))
+	utils.Logger.Infof("IEM on-demand peak hour for %s: %.1f (from %d days)", city, computed, len(peakHours))
+	return computed
+}
 
 // checkObviousNo returns true if the running high already makes a NO outcome
 // certain regardless of time of day. Since temperature can only go up during
