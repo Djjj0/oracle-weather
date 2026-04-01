@@ -20,6 +20,8 @@ import (
 	pkgweather "github.com/djbro/oracle-weather/pkg/weather"
 )
 
+var httpClient = &http.Client{Timeout: 20 * time.Second}
+
 // cityMap is the single source of truth: city → (ICAO station, IANA timezone, DB)
 // db: "us" → learning.db   "intl" → learning_international.db
 type cityEntry struct {
@@ -145,6 +147,7 @@ func main() {
 	usDBPath := flag.String("us-db", "./data/learning.db", "Path to US learning DB")
 	intlDBPath := flag.String("intl-db", "./data/learning_international.db", "Path to international learning DB")
 	force := flag.Bool("force", false, "Re-backfill cities that already have data")
+	loop := flag.Bool("loop", false, "Keep running until all cities have >= 5 days of data")
 	flag.Parse()
 
 	usDB, err := pkgweather.NewLearningDB(*usDBPath)
@@ -161,72 +164,93 @@ func main() {
 	}
 	defer intlDB.Close()
 
-	now := time.Now().UTC()
-	total := 0
-	skipped := 0
-	totalRowsAdded := 0
-
-	for city, entry := range cities {
-		db := usDB
-		if entry.db == "intl" {
-			db = intlDB
+	round := 0
+	for {
+		round++
+		if *loop {
+			fmt.Printf("\n=== Round %d ===\n", round)
 		}
 
-		// Skip if already has enough real data (unless --force is set)
-		if !*force {
-			if stats, err := db.GetCityStats(city); err == nil && stats.TotalMarkets >= 5 {
-				fmt.Printf("  SKIP %-22s — already has %d markets in DB\n", city, stats.TotalMarkets)
-				skipped++
-				continue
-			}
-		}
+		now := time.Now().UTC()
+		total := 0
+		skipped := 0
+		totalRowsAdded := 0
+		remaining := 0
 
-		fmt.Printf("  BACKFILL %-22s (%s) ...\n", city, entry.station)
-
-		loc, err := time.LoadLocation(entry.timezone)
-		if err != nil {
-			fmt.Printf("    ERROR loading timezone %s: %v\n", entry.timezone, err)
-			continue
-		}
-
-		added := 0
-		for i := 1; i <= *days; i++ {
-			date := now.AddDate(0, 0, -i)
-
-			peakHour, peakTemp, err := fetchDailyPeak(entry.station, date, loc)
-			if err != nil {
-				// Not all days will have data — skip silently
-				continue
+		for city, entry := range cities {
+			db := usDB
+			if entry.db == "intl" {
+				db = intlDB
 			}
 
-			// Build a synthetic high_temp_time at the peak hour on that local date
-			localDate := date.In(loc)
-			peakHourInt := int(peakHour)
-			peakMin := int((peakHour - float64(peakHourInt)) * 60)
-			highTempTime := time.Date(localDate.Year(), localDate.Month(), localDate.Day(),
-				peakHourInt, peakMin, 0, 0, loc)
-
-			marketID := fmt.Sprintf("backfill_%s_%s", entry.station, date.Format("2006-01-02"))
-
-			if err := db.RecordMarketOutcome(
-				marketID, city, entry.timezone,
-				date, peakTemp, highTempTime, highTempTime.Add(time.Hour), true,
-			); err != nil {
-				// Duplicate key on re-run is fine — ignore
-				if !strings.Contains(err.Error(), "UNIQUE") {
-					fmt.Printf("    WARN %s: %v\n", date.Format("2006-01-02"), err)
+			// Skip if already has enough real data (unless --force is set)
+			if !*force {
+				if stats, err := db.GetCityStats(city); err == nil && stats.TotalMarkets >= 5 {
+					if round == 1 {
+						fmt.Printf("  SKIP %-22s — already has %d markets in DB\n", city, stats.TotalMarkets)
+					}
+					skipped++
+					continue
 				}
+			}
+
+			fmt.Printf("  BACKFILL %-22s (%s) ...\n", city, entry.station)
+
+			loc, err := time.LoadLocation(entry.timezone)
+			if err != nil {
+				fmt.Printf("    ERROR loading timezone %s: %v\n", entry.timezone, err)
 				continue
 			}
-			added++
+
+			added := 0
+			for i := 1; i <= *days; i++ {
+				date := now.AddDate(0, 0, -i)
+
+				peakHour, peakTemp, err := fetchDailyPeak(entry.station, date, loc)
+				if err != nil {
+					continue
+				}
+
+				localDate := date.In(loc)
+				peakHourInt := int(peakHour)
+				peakMin := int((peakHour - float64(peakHourInt)) * 60)
+				highTempTime := time.Date(localDate.Year(), localDate.Month(), localDate.Day(),
+					peakHourInt, peakMin, 0, 0, loc)
+
+				marketID := fmt.Sprintf("backfill_%s_%s", entry.station, date.Format("2006-01-02"))
+
+				if err := db.RecordMarketOutcome(
+					marketID, city, entry.timezone,
+					date, peakTemp, highTempTime, highTempTime.Add(time.Hour), true,
+				); err != nil {
+					if !strings.Contains(err.Error(), "UNIQUE") {
+						fmt.Printf("    WARN %s: %v\n", date.Format("2006-01-02"), err)
+					}
+					continue
+				}
+				added++
+			}
+
+			fmt.Printf("    → added %d days\n", added)
+			totalRowsAdded += added
+			total++
+
+			// Check if this city still needs more data
+			if stats, err := db.GetCityStats(city); err == nil && stats.TotalMarkets < 5 {
+				remaining++
+			}
 		}
 
-		fmt.Printf("    → added %d days\n", added)
-		totalRowsAdded += added
-		total++
-	}
+		fmt.Printf("\nRound %d done. Backfilled %d cities, skipped %d. Rows added: %d. Cities still needing data: %d\n",
+			round, total, skipped, totalRowsAdded, remaining)
 
-	fmt.Printf("\nDone. Backfilled %d cities, skipped %d (already have data). Total rows added: %d\n", total, skipped, totalRowsAdded)
+		if !*loop || remaining == 0 {
+			break
+		}
+
+		fmt.Printf("Waiting 30s before next round...\n")
+		time.Sleep(30 * time.Second)
+	}
 }
 
 // fetchDailyPeak fetches hourly METAR observations from IEM for a single day
@@ -246,13 +270,26 @@ func fetchDailyPeak(station string, date time.Time, loc *time.Location) (peakHou
 		tzName,
 	)
 
-	resp, httpErr := http.Get(url)
-	if httpErr != nil {
-		return 0, 0, httpErr
+	var body []byte
+	for attempt := 1; attempt <= 3; attempt++ {
+		resp, httpErr := httpClient.Get(url)
+		if httpErr != nil {
+			if attempt == 3 {
+				return 0, 0, httpErr
+			}
+			time.Sleep(time.Duration(attempt) * 2 * time.Second)
+			continue
+		}
+		body, _ = io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode == 200 {
+			break
+		}
+		if attempt == 3 {
+			return 0, 0, fmt.Errorf("HTTP %d", resp.StatusCode)
+		}
+		time.Sleep(time.Duration(attempt) * 2 * time.Second)
 	}
-	defer resp.Body.Close()
-
-	body, _ := io.ReadAll(resp.Body)
 	lines := strings.Split(strings.TrimSpace(string(body)), "\n")
 	if len(lines) < 2 {
 		return 0, 0, fmt.Errorf("no data")
