@@ -48,7 +48,7 @@ type LearningDB struct {
 
 // NewLearningDB creates/opens the learning database
 func NewLearningDB(dbPath string) (*LearningDB, error) {
-	db, err := sql.Open("sqlite", dbPath)
+	db, err := sql.Open("sqlite", dbPath+"?_busy_timeout=10000")
 	if err != nil {
 		return nil, fmt.Errorf("failed to open learning database: %w", err)
 	}
