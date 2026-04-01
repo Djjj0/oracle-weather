@@ -326,11 +326,20 @@ func (s *OracleLagStrategy) ScanOpportunities(ctx context.Context) (<-chan Oppor
 		var wg sync.WaitGroup
 		var resultMu sync.Mutex
 
-		for _, market := range markets {
+		for i, market := range markets {
 			select {
 			case <-ctx.Done():
 				break
 			default:
+			}
+
+			// Stagger resolver dispatches to avoid IEM rate limits
+			if i > 0 {
+				select {
+				case <-ctx.Done():
+					break
+				case <-time.After(500 * time.Millisecond):
+				}
 			}
 
 			wg.Add(1)
@@ -627,7 +636,7 @@ func (s *OracleLagStrategy) ExecuteOpportunity(ctx context.Context, opp Opportun
 	// the latest opp.CurrentPrice after a price update on retry.
 	minSharesCheck := positionSize / opp.CurrentPrice
 	if minSharesCheck < 5.0 {
-		positionSize = 5.0 * opp.CurrentPrice
+		positionSize = math.Max(5.0*opp.CurrentPrice, 5.0)
 		utils.Logger.Infof("Position bumped to 5-share minimum (cost: $%.2f at price $%.2f)", positionSize, opp.CurrentPrice)
 	}
 

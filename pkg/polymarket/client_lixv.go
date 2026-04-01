@@ -72,7 +72,7 @@ func NewClientLixv(cfg *config.Config) *PolymarketClientLixv {
 	}
 
 	// Rate limiting
-	rateLimiter := rate.NewLimiter(rate.Every(100*time.Millisecond), 10)
+	rateLimiter := rate.NewLimiter(rate.Every(300*time.Millisecond), 3)
 
 	// Gamma API client
 	gammaClient := resty.New()
@@ -561,23 +561,37 @@ func (c *PolymarketClientLixv) GetWeatherMarkets() ([]Market, error) {
 	seen := make(map[string]struct{})
 
 	for offset := 0; ; offset += pageSize {
-		c.rateLimiter.Wait(context.Background())
-
 		var events []weatherEvent
-		resp, err := c.gammaClient.R().
-			SetResult(&events).
-			SetQueryParam("closed", "false").
-			SetQueryParam("limit", fmt.Sprintf("%d", pageSize)).
-			SetQueryParam("offset", fmt.Sprintf("%d", offset)).
-			SetQueryParam("tag_slug", "weather").
-			Get("/events")
+		var fetchOK bool
 
-		if err != nil {
-			utils.Logger.Warnf("Weather events fetch error at offset %d: %v", offset, err)
-			break
+		for attempt := 1; attempt <= 3; attempt++ {
+			c.rateLimiter.Wait(context.Background())
+			events = nil // reset for each retry attempt
+
+			resp, err := c.gammaClient.R().
+				SetResult(&events).
+				SetQueryParam("closed", "false").
+				SetQueryParam("limit", fmt.Sprintf("%d", pageSize)).
+				SetQueryParam("offset", fmt.Sprintf("%d", offset)).
+				SetQueryParam("tag_slug", "weather").
+				Get("/events")
+
+			if err != nil {
+				utils.Logger.Warnf("Weather events fetch error at offset %d (attempt %d/3): %v", offset, attempt, err)
+			} else if resp.IsError() {
+				utils.Logger.Warnf("Weather events API error at offset %d (attempt %d/3): %s", offset, attempt, resp.Status())
+			} else {
+				fetchOK = true
+				break
+			}
+
+			if attempt < 3 {
+				time.Sleep(time.Duration(attempt) * 3 * time.Second)
+			}
 		}
-		if resp.IsError() {
-			utils.Logger.Warnf("Weather events API error at offset %d: %s", offset, resp.Status())
+
+		if !fetchOK {
+			utils.Logger.Warnf("Weather events: giving up at offset %d after 3 attempts", offset)
 			break
 		}
 		if len(events) == 0 {
@@ -611,6 +625,9 @@ func (c *PolymarketClientLixv) GetWeatherMarkets() ([]Market, error) {
 		if len(events) < pageSize {
 			break // last page
 		}
+
+		// Throttle between pages to avoid hammering Gamma API
+		time.Sleep(300 * time.Millisecond)
 	}
 
 	utils.Logger.Infof("GetWeatherMarkets: fetched %d unique markets from weather events", len(allMarkets))

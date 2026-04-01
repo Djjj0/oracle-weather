@@ -286,6 +286,39 @@ func GetAllTimeProfit(db *bolt.DB) (float64, error) {
 	return total, err
 }
 
+// GetClosedPositionsByDate retrieves positions closed on a specific date (up to limit; 0 = all).
+// A position is "closed on date" when its ClaimedAt timestamp matches the given YYYY-MM-DD string.
+func GetClosedPositionsByDate(db *bolt.DB, date string, limit int) ([]Position, error) {
+	var positions []Position
+
+	err := db.View(func(tx *bolt.Tx) error {
+		b := tx.Bucket(positionsBucket)
+		if b == nil {
+			return nil
+		}
+		c := b.Cursor()
+		for k, v := c.First(); k != nil; k, v = c.Next() {
+			if limit > 0 && len(positions) >= limit {
+				break
+			}
+			var pos Position
+			if err := json.Unmarshal(v, &pos); err != nil {
+				continue
+			}
+			if pos.Status == "OPEN" {
+				continue
+			}
+			if pos.ClaimedAt.Format("2006-01-02") != date {
+				continue
+			}
+			positions = append(positions, pos)
+		}
+		return nil
+	})
+
+	return positions, err
+}
+
 // GetRecentOpportunities retrieves recent opportunities
 func GetRecentOpportunities(db *bolt.DB, limit int) ([]Opportunity, error) {
 	var opportunities []Opportunity

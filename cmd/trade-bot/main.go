@@ -194,6 +194,21 @@ func runDailyReport(ctx context.Context, db *bolt.DB, cfg *config.Config, logger
 			logger.Errorf("Daily report: failed to get open positions: %v", err)
 		}
 
+		closedPositions, err := database.GetClosedPositionsByDate(db, yesterday, 10)
+		if err != nil {
+			logger.Errorf("Daily report: failed to get closed positions: %v", err)
+		}
+		summaries := make([]utils.PositionSummary, 0, len(closedPositions))
+		for _, p := range closedPositions {
+			summaries = append(summaries, utils.PositionSummary{
+				MarketQuestion: p.MarketQuestion,
+				Outcome:        p.Outcome,
+				EntryPrice:     p.EntryPrice,
+				Cost:           p.PositionSize,
+				PnL:            p.Profit,
+			})
+		}
+
 		msg := utils.DailyPnLReportMessage(
 			dateLabel,
 			dailyStats.Wins,
@@ -203,6 +218,7 @@ func runDailyReport(ctx context.Context, db *bolt.DB, cfg *config.Config, logger
 			allTimeProfit,
 			goalAmount,
 			len(openPositions),
+			summaries,
 		)
 
 		logger.Infof("Sending daily P&L report:\n%s", msg)

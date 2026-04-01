@@ -51,15 +51,21 @@ func OpportunityFoundMessage(marketQuestion, outcome string, currentPrice, expec
 // TradeExecutedMessage creates a rich Discord notification for a placed trade.
 // reasoning is a multi-line string (produced in ScanOpportunities) explaining the decision.
 func TradeExecutedMessage(marketQuestion, outcome string, entryPrice, positionSize, expectedProfit, confidence float64, reasoning string) string {
+	expectedPnL := positionSize * expectedProfit
+	pnlSign := "+"
+	if expectedPnL < 0 {
+		pnlSign = ""
+	}
 	msg := fmt.Sprintf(
 		"🤖 **Trade Placed**\n"+
 			"📋 **Market:** %s\n"+
 			"✅ **Outcome:** %s\n"+
 			"💵 **Entry price:** $%.2f\n"+
-			"📐 **Position size:** $%.2f\n"+
+			"📐 **Cost:** $%.2f\n"+
+			"📈 **Expected PNL:** %s$%.2f\n"+
 			"─────────────────────\n"+
 			"🧠 **Why placed:**\n",
-		marketQuestion, outcome, entryPrice, positionSize,
+		marketQuestion, outcome, entryPrice, positionSize, pnlSign, expectedPnL,
 	)
 	if reasoning != "" {
 		// reasoning lines are already formatted; indent each line as a bullet
@@ -79,8 +85,18 @@ func TradeExecutedMessage(marketQuestion, outcome string, entryPrice, positionSi
 	return msg
 }
 
-// DailyPnLReportMessage creates the formatted 8am daily P&L report
-func DailyPnLReportMessage(date string, wins, losses, totalTrades int, yesterdayPnL, allTimePnL, goalAmount float64, openPositions int) string {
+// PositionSummary is a lightweight trade record for daily report formatting.
+type PositionSummary struct {
+	MarketQuestion string
+	Outcome        string
+	EntryPrice     float64
+	Cost           float64 // dollars invested
+	PnL            float64 // realised profit (positive = win)
+}
+
+// DailyPnLReportMessage creates the formatted 8am daily P&L report.
+// recentTrades may be nil; when non-empty, a per-trade breakdown is appended (capped at 10).
+func DailyPnLReportMessage(date string, wins, losses, totalTrades int, yesterdayPnL, allTimePnL, goalAmount float64, openPositions int, recentTrades []PositionSummary) string {
 	goalProgress := 0.0
 	if goalAmount > 0 {
 		goalProgress = allTimePnL / goalAmount * 100
@@ -96,7 +112,7 @@ func DailyPnLReportMessage(date string, wins, losses, totalTrades int, yesterday
 		allTimeSign = ""
 	}
 
-	return fmt.Sprintf(
+	msg := fmt.Sprintf(
 		"📈 Daily P&L Report — %s\n"+
 			"─────────────────────────────\n"+
 			"Yesterday's trades: %d\n"+
@@ -111,6 +127,28 @@ func DailyPnLReportMessage(date string, wins, losses, totalTrades int, yesterday
 		allTimePnL, goalAmount, goalProgress,
 		openPositions,
 	)
+
+	if len(recentTrades) > 0 {
+		msg += "\n─────────────────────────────\n📝 Yesterday's trades:\n"
+		limit := len(recentTrades)
+		if limit > 10 {
+			limit = 10
+		}
+		for _, t := range recentTrades[:limit] {
+			pnlSign := "+"
+			if t.PnL < 0 {
+				pnlSign = ""
+			}
+			label := t.MarketQuestion
+			if len(label) > 40 {
+				label = label[:37] + "..."
+			}
+			msg += fmt.Sprintf("  • %s → %s @ $%.2f, cost $%.2f, PNL %s$%.2f\n",
+				label, t.Outcome, t.EntryPrice, t.Cost, pnlSign, t.PnL)
+		}
+	}
+
+	return msg
 }
 
 // ScanSummaryMessage creates a formatted Discord message summarising a single scan cycle.

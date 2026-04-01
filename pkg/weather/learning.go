@@ -380,6 +380,72 @@ func (l *LearningDB) RecordMarketOutcome(marketID, city, timezone string, date t
 	return nil
 }
 
+// HistoryCitySummary summarises one city's rows in market_history joined with city_stats.
+type HistoryCitySummary struct {
+	City        string
+	Count       int
+	MinDate     string
+	MaxDate     string
+	AvgPeakHour float64 // from city_stats (avg_high_temp_hour)
+	Confidence  float64 // from city_stats (confidence_score)
+}
+
+// GetHistoryCitySummaries returns per-city row counts, date ranges, and learning stats.
+func (l *LearningDB) GetHistoryCitySummaries() ([]HistoryCitySummary, error) {
+	query := `
+		SELECT h.city, COUNT(*), MIN(h.date), MAX(h.date),
+		       COALESCE(cs.avg_high_temp_hour, 0),
+		       COALESCE(cs.confidence_score, 0)
+		FROM market_history h
+		LEFT JOIN city_stats cs ON lower(h.city) = lower(cs.city)
+		GROUP BY h.city
+		ORDER BY h.city
+	`
+	rows, err := l.db.Query(query)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var summaries []HistoryCitySummary
+	for rows.Next() {
+		var s HistoryCitySummary
+		if err := rows.Scan(&s.City, &s.Count, &s.MinDate, &s.MaxDate, &s.AvgPeakHour, &s.Confidence); err != nil {
+			continue
+		}
+		summaries = append(summaries, s)
+	}
+	return summaries, rows.Err()
+}
+
+// GetCityMarketHistory returns all market_history rows for a city ordered by date desc.
+func (l *LearningDB) GetCityMarketHistory(city string) ([]MarketPattern, error) {
+	query := `SELECT market_id, city, date, timezone, high_temp, high_temp_time,
+	                 iem_data_final_time, market_resolved_time, optimal_entry_time,
+	                 data_lag_minutes, resolution_lag_minutes, success, notes
+	          FROM market_history WHERE lower(city) = lower(?) ORDER BY date DESC`
+	rows, err := l.db.Query(query, strings.ToLower(city))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var patterns []MarketPattern
+	for rows.Next() {
+		var p MarketPattern
+		if err := rows.Scan(
+			&p.MarketID, &p.City, &p.Date, &p.Timezone, &p.HighTemp,
+			&p.HighTempTime, &p.IEMDataFinalTime, &p.MarketResolvedTime,
+			&p.OptimalEntryTime, &p.DataLagMinutes, &p.ResolutionLagMinutes,
+			&p.Success, &p.Notes,
+		); err != nil {
+			continue
+		}
+		patterns = append(patterns, p)
+	}
+	return patterns, rows.Err()
+}
+
 // GetCityByStation looks up city name by station code
 func (l *LearningDB) GetCityByStation(stationCode string) (string, error) {
 	query := `SELECT city FROM city_timezone_map WHERE iem_station = ?`

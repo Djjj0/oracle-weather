@@ -236,7 +236,8 @@ func (w *IEMWeatherResolver) CheckResolution(market polymarket.Market) (*string,
 	if data.Condition == "rain" || data.Condition == "precipitation" {
 		totalPrecip, err := w.getIEMPrecip(airportCode, data.Date, loc)
 		if err != nil {
-			return nil, 0, fmt.Errorf("IEM precip API error: %w", err)
+			utils.Logger.Debugf("IEM precip transient error for %s — will retry next cycle: %v", data.Location, err)
+			return nil, 0, nil
 		}
 
 		localDate := data.Date.In(loc)
@@ -261,7 +262,8 @@ func (w *IEMWeatherResolver) CheckResolution(market polymarket.Market) (*string,
 	// UTC queries include the previous afternoon's readings for western timezones)
 	runningHigh, obsCount, err := w.getIEMHighTemp(airportCode, data.Date, useCelsius, loc)
 	if err != nil {
-		return nil, 0, fmt.Errorf("IEM API error: %w", err)
+		utils.Logger.Debugf("IEM temp transient error for %s — will retry next cycle: %v", data.Location, err)
+		return nil, 0, nil
 	}
 
 	now := time.Now().In(loc)
@@ -281,9 +283,12 @@ func (w *IEMWeatherResolver) CheckResolution(market polymarket.Market) (*string,
 	utils.Logger.Debugf("IEM running high: %s (%s) on %s = %.1f%s at %.1f local hour (obs=%d)",
 		data.Location, airportCode, data.Date.Format("2006-01-02"), runningHigh, unitSymbol, currentHour, obsCount)
 
-	// Determine typical peak hour for this city from learning DB
-	// Falls back to 15.0 (3 PM) if not yet in DB
-	typicalPeakHour := w.getTypicalPeakHour(data.Location, loc)
+	// Determine typical peak hour for this city from learning DB.
+	// Returns -1 if no data — skip the market until backfill runs.
+	typicalPeakHour := w.getTypicalPeakHour(data.Location)
+	if typicalPeakHour < 0 {
+		return nil, 0, nil
+	}
 
 	// Check for an obvious NO: running high already clearly exceeds a ceiling threshold.
 	// This is safe with any number of observations — the high can only go up.
@@ -326,154 +331,25 @@ func (w *IEMWeatherResolver) CheckResolution(market polymarket.Market) (*string,
 }
 
 // getTypicalPeakHour returns the optimal entry hour for a city from the learning DB.
-// OptimalEntryHour = avgHighTempHour + 1h safety buffer, so pastPeak fires at the
-// right time based on actual historical data rather than a generic default.
-// Falls back to cityDefaultPeakHour if no learning data (< 5 markets).
-func (w *IEMWeatherResolver) getTypicalPeakHour(city string, loc *time.Location) float64 {
+// Returns -1 if the city has insufficient data — callers must treat -1 as "not
+// actionable yet" and skip rather than guess. Run cmd/backfill-peak-hours to populate.
+func (w *IEMWeatherResolver) getTypicalPeakHour(city string) float64 {
 	cityLC := strings.ToLower(city)
 
-	// Check US DB first
 	if w.learningDB != nil {
 		if stats, err := w.learningDB.GetCityStats(cityLC); err == nil && stats.TotalMarkets >= 5 {
 			return stats.OptimalEntryHour
 		}
 	}
-	// Fall back to international DB
 	if w.intlDB != nil {
 		if stats, err := w.intlDB.GetCityStats(cityLC); err == nil && stats.TotalMarkets >= 5 {
 			return stats.OptimalEntryHour
 		}
 	}
-	return cityDefaultPeakHour(cityLC) // City-specific default if no learning DB data
+	utils.Logger.Debugf("IEM: no peak hour data for %q — run backfill-peak-hours", cityLC)
+	return -1
 }
 
-// cityDefaultPeakHour returns a reasonable default peak hour for a city when
-// the learning database has insufficient data. These are based on typical
-// climatology — coastal/humid cities peak later, desert/continental cities
-// peak earlier. All values are local solar time (hour of day, 24h).
-func cityDefaultPeakHour(city string) float64 {
-	defaults := map[string]float64{
-		// North America — continental interior peaks early-mid afternoon
-		"chicago":       15.0,
-		"dallas":        15.0,
-		"denver":        14.5,
-		"houston":       15.0,
-		"kansas city":   15.0,
-		"minneapolis":   14.5,
-		"nashville":     15.0,
-		"memphis":       15.0,
-		"austin":        15.0,
-		"san antonio":   15.0,
-		"detroit":       15.0,
-		"charlotte":     15.0,
-		"atlanta":       15.0,
-		"washington":    15.0,
-		"philadelphia":  15.0,
-		"boston":        15.0,
-		"new york":      15.0,
-		"new york city": 15.0,
-		// Coastal US — marine influence delays peak
-		"seattle":       15.5,
-		"portland":      15.5,
-		"san francisco": 15.5,
-		"los angeles":   15.5,
-		"san diego":     15.5,
-		"miami":         14.5, // tropical — peaks earlier due to afternoon storms
-		"tampa":         14.5,
-		"orlando":       14.5,
-		// Desert Southwest
-		"phoenix": 15.0,
-		"las vegas": 15.0,
-		// Canada
-		"toronto": 15.0,
-		// South America — subtropical, peaks mid-afternoon
-		"buenos aires": 15.0,
-		"sao paulo":    14.0, // tropical, convective — peaks early
-		// Europe — generally peaks around 14:00-15:00 local
-		"london":    14.0,
-		"paris":     14.5,
-		"berlin":    14.5,
-		"madrid":    16.0, // Mediterranean — late peak
-		"barcelona": 16.0,
-		"rome":      15.5,
-		"milan":     15.0,
-		"munich":    14.5,
-		"frankfurt": 14.5,
-		"amsterdam": 14.5,
-		"brussels":  14.5,
-		"vienna":    15.0,
-		"prague":    15.0,
-		"warsaw":    15.0,
-		"budapest":  15.5,
-		"zurich":    14.5,
-		"stockholm": 14.0,
-		"copenhagen":14.0,
-		"oslo":      14.0,
-		"helsinki":  14.0,
-		"lisbon":    16.0, // Iberian — late peak
-		"athens":    15.5,
-		"moscow":    14.0,
-		// Asia — varies significantly
-		"dubai":      15.0, // desert, but sea breeze limits peak
-		"mumbai":     14.0, // coastal, humid — peaks before afternoon convection
-		"delhi":      15.0,
-		"lucknow":    15.0,
-		"ankara":     15.0,
-		"beijing":    15.0,
-		"shanghai":   14.5,
-		"hong kong":  14.0, // subtropical coastal
-		"singapore":  13.0, // equatorial — peaks early before afternoon storms
-		"seoul":      14.0,
-		"tokyo":      14.0,
-		// Oceania
-		"sydney":     15.0,
-		"melbourne":  15.0,
-		"wellington": 14.0, // windy, maritime
-		// Middle East
-		"tel aviv":    15.0, // Mediterranean coast
-		"istanbul":    15.0,
-		"riyadh":      15.0, // desert
-		"doha":        15.0, // desert
-		"kuwait city": 15.0, // desert
-		// Africa
-		"cairo":         15.0, // desert
-		"johannesburg":  15.0,
-		"cape town":     15.0,
-		"lagos":         14.0, // tropical coastal
-		"nairobi":       14.0, // equatorial highland
-		"casablanca":    15.0, // coastal Mediterranean
-		// South / Southeast Asia
-		"karachi":          15.0,
-		"lahore":           15.0,
-		"chennai":          14.0, // coastal tropical
-		"kolkata":          14.0,
-		"hyderabad":        15.0,
-		"bangalore":        14.0,
-		"bangkok":          13.0, // tropical — peaks early before afternoon storms
-		"jakarta":          13.0, // equatorial
-		"manila":           13.0, // tropical
-		"ho chi minh city": 13.0, // tropical
-		"kuala lumpur":     13.0, // equatorial
-		// East Asia
-		"taipei": 14.0,
-		"osaka":  14.0, // same as Tokyo
-		// Latin America
-		"lima":        14.0, // coastal, low cloud
-		"bogota":      14.0, // high altitude equatorial
-		"santiago":    15.0,
-		"caracas":     14.0,
-		"guadalajara": 15.0,
-		"monterrey":   15.0,
-		"havana":      14.0, // tropical
-		"san juan":    14.0, // tropical
-		// Mexico
-		"mexico city": 15.0,
-	}
-	if h, ok := defaults[city]; ok {
-		return h
-	}
-	return 15.0 // Conservative fallback
-}
 
 // checkObviousNo returns true if the running high already makes a NO outcome
 // certain regardless of time of day. Since temperature can only go up during
@@ -643,18 +519,19 @@ func (w *IEMWeatherResolver) getIEMHighTemp(station string, date time.Time, cels
 	}
 
 	// Extract temperatures from CSV (skip header).
-	// Columns: station, valid, tmpf, report_type
-	// Belt-and-braces METAR guard — server-side filter should already exclude SPECI.
+	// Columns: station, valid, tmpf[, report_type]
+	// IEM may or may not return the report_type column; server-side filter
+	// (report_type=3&report_type=4) already excludes SPECI, so we only drop
+	// it client-side when the column is actually present.
 	var temps []float64
 	for _, line := range lines[1:] {
 		parts := strings.Split(line, ",")
-		if len(parts) < 4 {
+		if len(parts) < 3 {
 			continue
 		}
 
-		// Drop SPECI (report_type=4) only — international stations may use
-		// codes other than "3", so we allow anything that isn't an explicit SPECI.
-		if strings.TrimSpace(parts[3]) == "4" {
+		// Drop SPECI (report_type=4) only if the column is present.
+		if len(parts) >= 4 && strings.TrimSpace(parts[3]) == "4" {
 			continue
 		}
 
@@ -738,7 +615,7 @@ func (w *IEMWeatherResolver) getIEMPrecip(station string, date time.Time, loc *t
 
 	lines := strings.Split(strings.TrimSpace(resp.String()), "\n")
 	if len(lines) < 2 {
-		return 0, fmt.Errorf("no precip data returned from IEM for station %s on %s", station, date.Format("2006-01-02"))
+		return 0, nil
 	}
 
 	// CSV columns: station, valid, p01i
@@ -765,7 +642,7 @@ func (w *IEMWeatherResolver) getIEMPrecip(station string, date time.Time, loc *t
 	}
 
 	if validReadings == 0 {
-		return 0, fmt.Errorf("no valid precip readings for %s on %s", station, date.Format("2006-01-02"))
+		return 0, nil
 	}
 
 	utils.Logger.Debugf("IEM precip: %s on %s = %.4f in total (%d readings)", station, date.Format("2006-01-02"), totalPrecip, validReadings)

@@ -17,6 +17,9 @@ type MarketMonitor struct {
 	client           *polymarket.PolymarketClient
 	config           *config.Config
 	categoryKeywords map[string][]string // Pre-compiled keywords for faster matching
+	cachedMarkets    []polymarket.Market
+	lastFetch        time.Time
+	cacheMu          sync.RWMutex
 }
 
 // NewMonitor creates a new market monitor
@@ -51,11 +54,29 @@ const EarlyEntryWindow = 14 * time.Hour
 func (m *MarketMonitor) GetMarketsPastResolution(ctx context.Context) ([]polymarket.Market, error) {
 	utils.Logger.Info("Fetching active markets...")
 
-	// Fetch weather markets directly by category — avoids paginating 30k+ markets
-	// and is resilient to Polymarket API instability (GOAWAY errors at high offsets).
-	markets, err := m.client.GetWeatherMarkets()
-	if err != nil {
-		return nil, fmt.Errorf("failed to get active markets: %w", err)
+	const cacheTTL = 5 * time.Minute
+
+	// Check cache to avoid calling Gamma API every 60s scan cycle
+	m.cacheMu.RLock()
+	cacheAge := time.Since(m.lastFetch)
+	cached := m.cachedMarkets
+	m.cacheMu.RUnlock()
+
+	var markets []polymarket.Market
+	if cacheAge < cacheTTL && len(cached) > 0 {
+		utils.Logger.Infof("Using cached market list (%d markets, age: %s)", len(cached), cacheAge.Round(time.Second))
+		markets = cached
+	} else {
+		var err error
+		markets, err = m.client.GetWeatherMarkets()
+		if err != nil {
+			return nil, fmt.Errorf("failed to get active markets: %w", err)
+		}
+		m.cacheMu.Lock()
+		m.cachedMarkets = markets
+		m.lastFetch = time.Now()
+		m.cacheMu.Unlock()
+		utils.Logger.Infof("Market cache refreshed: %d markets", len(markets))
 	}
 
 	utils.Logger.Infof("Found %d active markets", len(markets))
