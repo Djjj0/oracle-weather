@@ -93,7 +93,7 @@ var cities = map[string]cityEntry{
 	"lisbon":     {"LPPT", "Europe/Lisbon", "intl"},
 	"athens":     {"LGAV", "Europe/Athens", "intl"},
 	"istanbul":   {"LTBA", "Europe/Istanbul", "intl"},
-	"moscow":     {"UUEE", "Europe/Moscow", "intl"},
+	"moscow":     {"UUWW", "Europe/Moscow", "intl"}, // Vnukovo — matches Polymarket resolution source
 	// Middle East
 	"tel aviv":    {"LLBG", "Asia/Jerusalem", "intl"},
 	"ankara":      {"LTAC", "Europe/Istanbul", "intl"},
@@ -107,7 +107,7 @@ var cities = map[string]cityEntry{
 	"seoul":             {"RKSI", "Asia/Seoul", "intl"},
 	"beijing":           {"ZBAA", "Asia/Shanghai", "intl"},
 	"shanghai":          {"ZSPD", "Asia/Shanghai", "intl"},
-	"hong kong":         {"VHHH", "Asia/Hong_Kong", "intl"},
+	"hong kong":         {"VHHX", "Asia/Hong_Kong", "intl"}, // HK Observatory HQ — matches Polymarket resolution source
 	"taipei":            {"RCTP", "Asia/Taipei", "intl"},
 	"singapore":         {"WSSS", "Asia/Singapore", "intl"},
 	"kuala lumpur":      {"WMKK", "Asia/Kuala_Lumpur", "intl"},
