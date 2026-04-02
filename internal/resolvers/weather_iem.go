@@ -68,7 +68,7 @@ var cityToAirport = map[string]string{
 	"philadelphia":   "KPHL",
 	"san antonio":    "KSAT",
 	"san diego":      "KSAN",
-	"dallas":         "KDFW",
+	"dallas":         "KDAL", // Love Field — Polymarket resolves on KDAL not KDFW
 	"miami":          "KMIA",
 	"atlanta":        "KATL",
 	"boston":         "KBOS",
@@ -96,7 +96,7 @@ var cityToAirport = map[string]string{
 	"sydney":         "YSSY",
 	"melbourne":      "YMML",
 	"singapore":      "WSSS",
-	"hong kong":      "VHHX", // HK Observatory HQ — Polymarket resolves via HKO station, not airport (VHHH)
+	"hong kong":      "VHHH", // HK International Airport — Polymarket resolves via Wunderground VHHH (HKO-operated airport station)
 	"beijing":        "ZBAA",
 	"shanghai":       "ZSPD",
 	"dubai":          "OMDB",
@@ -542,25 +542,6 @@ func (w *IEMWeatherResolver) determineOutcomeWithPeak(data *MarketData, runningH
 // local time, not UTC. Without this, western-timezone stations include the previous
 // afternoon's warm readings in what IEM calls "today's" UTC data.
 func (w *IEMWeatherResolver) getIEMHighTemp(station string, date time.Time, celsius bool, loc *time.Location) (float64, int, error) {
-	// Hong Kong: use HK Observatory Daily Extract instead of IEM ASOS.
-	// Polymarket resolves HK markets using HKO "Absolute Daily Max", which is
-	// published in the Daily Extract after the day ends. VHHX is not in IEM.
-	if station == "VHHX" {
-		temp, err := pkgweather.FetchHKODailyMax(date)
-		if err != nil {
-			return 0, 0, err
-		}
-		if temp == 0 {
-			// Data not yet published — not ready
-			return 0, 0, nil
-		}
-		// HKO returns Celsius; convert to Fahrenheit if caller expects °F
-		if !celsius {
-			temp = temp*9/5 + 32
-		}
-		return temp, 1, nil
-	}
-
 	// Use the UTC calendar date from the market question (e.g. "March 9") as the
 	// year/month/day for the IEM query. The tz param tells IEM to interpret that
 	// calendar date in the station's local midnight-to-midnight window.

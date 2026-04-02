@@ -37,7 +37,7 @@ var cities = map[string]cityEntry{
 	"philadelphia":   {"KPHL", "America/New_York", "us"},
 	"san antonio":    {"KSAT", "America/Chicago", "us"},
 	"san diego":      {"KSAN", "America/Los_Angeles", "us"},
-	"dallas":         {"KDFW", "America/Chicago", "us"},
+	"dallas":         {"KDAL", "America/Chicago", "us"}, // Love Field — Polymarket resolves on KDAL not KDFW
 	"miami":          {"KMIA", "America/New_York", "us"},
 	"atlanta":        {"KATL", "America/New_York", "us"},
 	"boston":         {"KBOS", "America/New_York", "us"},
@@ -107,7 +107,7 @@ var cities = map[string]cityEntry{
 	"seoul":             {"RKSI", "Asia/Seoul", "intl"},
 	"beijing":           {"ZBAA", "Asia/Shanghai", "intl"},
 	"shanghai":          {"ZSPD", "Asia/Shanghai", "intl"},
-	"hong kong":         {"VHHX", "Asia/Hong_Kong", "intl"}, // HK Observatory HQ — matches Polymarket resolution source
+	"hong kong":         {"VHHH", "Asia/Hong_Kong", "intl"}, // HK International Airport — Polymarket resolves via Wunderground VHHH
 	"taipei":            {"RCTP", "Asia/Taipei", "intl"},
 	"singapore":         {"WSSS", "Asia/Singapore", "intl"},
 	"kuala lumpur":      {"WMKK", "Asia/Kuala_Lumpur", "intl"},
