@@ -128,7 +128,7 @@ var cityToAirport = map[string]string{
 	"wellington":     "NZWN", // Wellington Intl
 	// Middle East
 	"tel aviv":       "LLBG", // Ben Gurion International
-	"istanbul":       "LTBA", // Atatürk International (WU reference station)
+	"istanbul":       "LTFM", // Istanbul Airport (new) — Polymarket resolves via LTFM; LTBA (Atatürk) closed 2019
 	"riyadh":         "OERK", // King Khalid International
 	"doha":           "OTHH", // Hamad International
 	"kuwait city":    "OKBK", // Kuwait International

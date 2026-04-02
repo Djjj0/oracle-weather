@@ -92,7 +92,7 @@ var cities = map[string]cityEntry{
 	"helsinki":   {"EFHK", "Europe/Helsinki", "intl"},
 	"lisbon":     {"LPPT", "Europe/Lisbon", "intl"},
 	"athens":     {"LGAV", "Europe/Athens", "intl"},
-	"istanbul":   {"LTBA", "Europe/Istanbul", "intl"},
+	"istanbul":   {"LTFM", "Europe/Istanbul", "intl"}, // Istanbul Airport (new) — matches Polymarket resolution source
 	"moscow":     {"UUWW", "Europe/Moscow", "intl"}, // Vnukovo — matches Polymarket resolution source
 	// Middle East
 	"tel aviv":    {"LLBG", "Asia/Jerusalem", "intl"},
