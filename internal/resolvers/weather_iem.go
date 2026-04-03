@@ -311,6 +311,18 @@ func (w *IEMWeatherResolver) CheckResolution(market polymarket.Market) (*string,
 		return &no, obviousConf, nil
 	}
 
+	// Check for an obvious YES: running high already clearly exceeds a floor threshold
+	// with ≥2° margin. Mirrors checkObviousNo — fires with just 1 observation.
+	// Only applies to temperature_above (temp_below/exact/range need peak confirmation).
+	obviousYes, obviousYesConf := w.checkObviousYes(data, runningHigh)
+	if obviousYes && obsCount >= 1 {
+		utils.Logger.Infof("✅ IEM resolved: %s on %s | Running high: %.1f%s | Outcome: Yes (obvious) | Confidence: %.0f%%",
+			data.Location, localDate.Format("2006-01-02"), runningHigh, unitSymbol, obviousYesConf*100)
+		w.cache.Store(cacheKey, CachedResult{Outcome: "Yes", Confidence: obviousYesConf})
+		yes := "Yes"
+		return &yes, obviousYesConf, nil
+	}
+
 	// For all other outcomes (YES bets, or NO-after-peak bets) require enough observations
 	// to trust the running high isn't stale overnight data.
 	// Exception: after 8pm local the day is done — 2 obs is sufficient.
@@ -438,6 +450,21 @@ func (w *IEMWeatherResolver) checkObviousNo(data *MarketData, runningHigh float6
 		if roundedHigh > data.Threshold {
 			return true, marginToConfidence(runningHigh - data.Threshold)
 		}
+	}
+	return false, 0
+}
+
+// checkObviousYes returns true if the running high already makes a YES outcome
+// certain for temperature_above markets, with at least 2° of margin.
+// Requires ≥2° margin to guard against station variance and rounding.
+func (w *IEMWeatherResolver) checkObviousYes(data *MarketData, runningHigh float64) (bool, float64) {
+	if data.Condition != "temperature_above" {
+		return false, 0
+	}
+	roundedHigh := math.Round(runningHigh)
+	margin := runningHigh - data.Threshold
+	if roundedHigh >= data.Threshold && margin >= 2.0 {
+		return true, marginToConfidence(margin)
 	}
 	return false, 0
 }
