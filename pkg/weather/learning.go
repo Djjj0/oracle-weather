@@ -136,6 +136,18 @@ func (l *LearningDB) Close() error {
 	return l.db.Close()
 }
 
+// DeleteCityData removes all records for a city from both market_history and city_stats.
+func (l *LearningDB) DeleteCityData(city string) error {
+	cityLC := strings.ToLower(city)
+	if _, err := l.db.Exec(`DELETE FROM market_history WHERE city = ?`, cityLC); err != nil {
+		return fmt.Errorf("delete market_history for %s: %w", city, err)
+	}
+	if _, err := l.db.Exec(`DELETE FROM city_stats WHERE city = ?`, cityLC); err != nil {
+		return fmt.Errorf("delete city_stats for %s: %w", city, err)
+	}
+	return nil
+}
+
 // AddMarketPattern adds a historical market pattern
 func (l *LearningDB) AddMarketPattern(pattern MarketPattern) error {
 	query := `
