@@ -132,10 +132,19 @@ func runPositionClaimer(ctx context.Context, strategy *strategies.OracleLagStrat
 	defer ticker.Stop()
 
 	runCycle := func() {
+		// Step 1: Claim/record any positions that have already resolved on-chain.
 		if result, err := strategy.CheckAndClaimPositions(ctx); err != nil && ctx.Err() == nil {
 			logger.Errorf("Position claimer error: %v", err)
 		} else if result != nil && (result.Wins > 0 || result.Losses > 0) {
 			logger.Infof("Position claim cycle: %d wins, %d losses, P&L: $%.2f", result.Wins, result.Losses, result.TotalProfit)
+		}
+
+		// Step 2: Re-run the IEM resolver against every still-open position.
+		// If the oracle has flipped (e.g. we bet YES on 25°C but IEM now confirms the
+		// actual high was 21°C), exit the position immediately at the current market
+		// price rather than holding to a guaranteed $0 resolution.
+		if err := strategy.ValidateAndExitBadPositions(ctx); err != nil && ctx.Err() == nil {
+			logger.Errorf("Position validator error: %v", err)
 		}
 	}
 

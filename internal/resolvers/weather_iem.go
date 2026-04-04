@@ -15,6 +15,16 @@ import (
 	"github.com/go-resty/resty/v2"
 )
 
+// cacheTTL is the maximum age of a cached IEM result before it is evicted and re-fetched.
+// IEM updates its ASOS feed roughly every hour, and temperatures can rise several degrees
+// between morning and midday, so 30 minutes is the safe upper bound.
+const cacheTTL = 30 * time.Minute
+
+// maxObsAge is the maximum age of the latest IEM observation before the data is considered
+// too stale to trade on. If IEM itself is delayed (e.g. Taipei station lag), we return
+// not_resolvable rather than betting on hours-old data.
+const maxObsAge = 2 * time.Hour
+
 // IEMWeatherResolver uses Iowa Environmental Mesonet (matches Wunderground/Polymarket)
 type IEMWeatherResolver struct {
 	BaseResolver
@@ -229,7 +239,16 @@ func (w *IEMWeatherResolver) CheckResolution(market polymarket.Market) (*string,
 	cacheKey := fmt.Sprintf("%s_%s_%s_%.1f", data.Location, data.Date.Format("2006-01-02"), data.Condition, data.Threshold)
 	if cached, ok := w.cache.Load(cacheKey); ok {
 		result := cached.(CachedResult)
-		return &result.Outcome, result.Confidence, nil
+		age := time.Since(result.CachedAt)
+		if age <= cacheTTL {
+			utils.Logger.Debugf("📦 Cache HIT %s (age %s)", cacheKey, age.Round(time.Second))
+			return &result.Outcome, result.Confidence, nil
+		}
+		utils.Logger.Infof("🗑️  Cache EVICT %s (age %s > %s TTL) — re-fetching live IEM data",
+			cacheKey, age.Round(time.Second), cacheTTL)
+		w.cache.Delete(cacheKey)
+	} else {
+		utils.Logger.Debugf("📭 Cache MISS %s", cacheKey)
 	}
 
 	// Rain/precipitation markets: use dedicated precipitation endpoint
@@ -253,16 +272,26 @@ func (w *IEMWeatherResolver) CheckResolution(market polymarket.Market) (*string,
 		utils.Logger.Infof("✅ IEM rain resolved: %s on %s | Total precip: %.4f in | Outcome: %s | Confidence: %.0f%%",
 			data.Location, localDate.Format("2006-01-02"), totalPrecip, outcome, confidence*100)
 
-		w.cache.Store(cacheKey, CachedResult{Outcome: outcome, Confidence: confidence})
+		w.cache.Store(cacheKey, CachedResult{Outcome: outcome, Confidence: confidence, CachedAt: time.Now()})
 		return &outcome, confidence, nil
 	}
 
 	// Fetch the current running high from IEM (max of all observations so far today)
 	// Pass loc so IEM uses local midnight-to-midnight, not UTC (critical fix:
 	// UTC queries include the previous afternoon's readings for western timezones)
-	runningHigh, obsCount, err := w.getIEMHighTemp(airportCode, data.Date, useCelsius, loc)
+	runningHigh, obsCount, latestObsTime, err := w.getIEMHighTemp(airportCode, data.Date, useCelsius, loc)
 	if err != nil {
 		utils.Logger.Debugf("IEM temp transient error for %s — will retry next cycle: %v", data.Location, err)
+		return nil, 0, nil
+	}
+
+	// Data freshness guard: if the latest ASOS observation is older than maxObsAge, the
+	// station feed is lagging (e.g. Taipei RCSS delayed 2-3h). Treat as not_resolvable
+	// rather than betting on stale data. A zero latestObsTime means we got no parseable
+	// timestamps (unusual), so we let the obs-count checks below handle it.
+	if !latestObsTime.IsZero() && time.Since(latestObsTime) > maxObsAge {
+		utils.Logger.Warnf("⚠️  IEM data for %s is stale: latest obs at %s (%s ago, >%s limit) — skipping",
+			data.Location, latestObsTime.Format("15:04 MST"), time.Since(latestObsTime).Round(time.Minute), maxObsAge)
 		return nil, 0, nil
 	}
 
@@ -306,7 +335,7 @@ func (w *IEMWeatherResolver) CheckResolution(market polymarket.Market) (*string,
 	if obviousNo && obsCount >= 1 {
 		utils.Logger.Infof("✅ IEM resolved: %s on %s | Running high: %.1f%s | Outcome: No (obvious) | Confidence: %.0f%%",
 			data.Location, localDate.Format("2006-01-02"), runningHigh, unitSymbol, obviousConf*100)
-		w.cache.Store(cacheKey, CachedResult{Outcome: "No", Confidence: obviousConf})
+		w.cache.Store(cacheKey, CachedResult{Outcome: "No", Confidence: obviousConf, CachedAt: time.Now()})
 		no := "No"
 		return &no, obviousConf, nil
 	}
@@ -318,7 +347,7 @@ func (w *IEMWeatherResolver) CheckResolution(market polymarket.Market) (*string,
 	if obviousYes && obsCount >= 1 {
 		utils.Logger.Infof("✅ IEM resolved: %s on %s | Running high: %.1f%s | Outcome: Yes (obvious) | Confidence: %.0f%%",
 			data.Location, localDate.Format("2006-01-02"), runningHigh, unitSymbol, obviousYesConf*100)
-		w.cache.Store(cacheKey, CachedResult{Outcome: "Yes", Confidence: obviousYesConf})
+		w.cache.Store(cacheKey, CachedResult{Outcome: "Yes", Confidence: obviousYesConf, CachedAt: time.Now()})
 		yes := "Yes"
 		return &yes, obviousYesConf, nil
 	}
@@ -347,7 +376,7 @@ func (w *IEMWeatherResolver) CheckResolution(market polymarket.Market) (*string,
 	utils.Logger.Infof("✅ IEM resolved: %s on %s | Running high: %.1f%s | Outcome: %s | Confidence: %.0f%%",
 		data.Location, localDate.Format("2006-01-02"), runningHigh, unitSymbol, outcome, confidence*100)
 
-	w.cache.Store(cacheKey, CachedResult{Outcome: outcome, Confidence: confidence})
+	w.cache.Store(cacheKey, CachedResult{Outcome: outcome, Confidence: confidence, CachedAt: time.Now()})
 	return &outcome, confidence, nil
 }
 
@@ -568,7 +597,9 @@ func (w *IEMWeatherResolver) determineOutcomeWithPeak(data *MarketData, runningH
 // loc is the station's local timezone — used so the date range is midnight-to-midnight
 // local time, not UTC. Without this, western-timezone stations include the previous
 // afternoon's warm readings in what IEM calls "today's" UTC data.
-func (w *IEMWeatherResolver) getIEMHighTemp(station string, date time.Time, celsius bool, loc *time.Location) (float64, int, error) {
+// Returns (runningHigh, obsCount, latestObsTime, error). latestObsTime is the timestamp
+// of the most recent ASOS observation, used by callers to detect stale station data.
+func (w *IEMWeatherResolver) getIEMHighTemp(station string, date time.Time, celsius bool, loc *time.Location) (float64, int, time.Time, error) {
 	// Use the UTC calendar date from the market question (e.g. "March 9") as the
 	// year/month/day for the IEM query. The tz param tells IEM to interpret that
 	// calendar date in the station's local midnight-to-midnight window.
@@ -590,18 +621,18 @@ func (w *IEMWeatherResolver) getIEMHighTemp(station string, date time.Time, cels
 
 	resp, err := w.client.R().Get(url)
 	if err != nil {
-		return 0, 0, fmt.Errorf("failed to fetch IEM data: %w", err)
+		return 0, 0, time.Time{}, fmt.Errorf("failed to fetch IEM data: %w", err)
 	}
 
 	if resp.IsError() {
-		return 0, 0, fmt.Errorf("IEM API returned error: %s", resp.Status())
+		return 0, 0, time.Time{}, fmt.Errorf("IEM API returned error: %s", resp.Status())
 	}
 
 	// Parse CSV response
 	lines := strings.Split(strings.TrimSpace(resp.String()), "\n")
 	if len(lines) < 2 {
 		// No observations yet — local day may not have started. Treat as not ready.
-		return 0, 0, nil
+		return 0, 0, time.Time{}, nil
 	}
 
 	// Extract temperatures from CSV (skip header).
@@ -610,6 +641,7 @@ func (w *IEMWeatherResolver) getIEMHighTemp(station string, date time.Time, cels
 	// (report_type=3&report_type=4) already excludes SPECI, so we only drop
 	// it client-side when the column is actually present.
 	var temps []float64
+	var latestObsTime time.Time
 	for _, line := range lines[1:] {
 		parts := strings.Split(line, ",")
 		if len(parts) < 3 {
@@ -619,6 +651,14 @@ func (w *IEMWeatherResolver) getIEMHighTemp(station string, date time.Time, cels
 		// Drop SPECI (report_type=4) only if the column is present.
 		if len(parts) >= 4 && strings.TrimSpace(parts[3]) == "4" {
 			continue
+		}
+
+		// Track the latest observation timestamp (column 1: "2006-01-02 15:04").
+		// IEM returns times in local timezone (controlled by the tz= query param).
+		if ts, parseErr := time.ParseInLocation("2006-01-02 15:04", strings.TrimSpace(parts[1]), loc); parseErr == nil {
+			if ts.After(latestObsTime) {
+				latestObsTime = ts
+			}
 		}
 
 		// Temperature is in 3rd column (index 2)
@@ -640,7 +680,7 @@ func (w *IEMWeatherResolver) getIEMHighTemp(station string, date time.Time, cels
 
 	if len(temps) == 0 {
 		// All rows filtered (e.g. all SPECI) or station not reporting yet.
-		return 0, 0, nil
+		return 0, 0, time.Time{}, nil
 	}
 
 	// Get daily high (max temperature)
@@ -656,7 +696,7 @@ func (w *IEMWeatherResolver) getIEMHighTemp(station string, date time.Time, cels
 		highTemp = (highTemp - 32) * 5 / 9
 	}
 
-	return highTemp, len(temps), nil
+	return highTemp, len(temps), latestObsTime, nil
 }
 
 // marginToConfidence converts degrees of margin from a threshold to a confidence value.

@@ -135,6 +135,33 @@ func (cb *CircuitBreaker) Reset() {
 	cb.tripReason = ""
 }
 
+// RecordLoss records a realized loss without incrementing the trade counter.
+// Use this when a position closes at a loss (the trade was already counted at entry via RecordTrade).
+// Calling RecordTrade again at resolution would double-count toward the daily trade limit.
+func (cb *CircuitBreaker) RecordLoss(loss float64) error {
+	if loss >= 0 {
+		return nil // not a loss
+	}
+	cb.CheckAndReset()
+
+	cb.mu.Lock()
+	defer cb.mu.Unlock()
+
+	cb.currentDailyLoss += -loss // loss is negative; store as positive amount
+
+	if cb.dailyLossLimit > 0 && cb.currentDailyLoss >= cb.dailyLossLimit {
+		cb.isTripped = true
+		cb.tripReason = fmt.Sprintf("Daily loss limit exceeded ($%.2f/$%.2f)",
+			cb.currentDailyLoss, cb.dailyLossLimit)
+		utils.Logger.Errorf("🚨 CIRCUIT BREAKER TRIPPED: %s", cb.tripReason)
+		if err := cb.sendAlert(); err != nil {
+			utils.Logger.Errorf("Failed to send circuit breaker alert: %v", err)
+		}
+		return fmt.Errorf("circuit breaker tripped: %s", cb.tripReason)
+	}
+	return nil
+}
+
 // GetDailyPnL returns current daily P&L (negative = loss)
 func (cb *CircuitBreaker) GetDailyPnL() float64 {
 	cb.mu.RLock()

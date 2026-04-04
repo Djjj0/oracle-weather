@@ -47,6 +47,7 @@ type BaseResolver struct {
 type CachedResult struct {
 	Outcome    string
 	Confidence float64
+	CachedAt   time.Time // when this result was cached; used for TTL eviction
 }
 
 // GetConfidence returns the confidence level

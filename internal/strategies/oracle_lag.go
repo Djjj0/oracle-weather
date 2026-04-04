@@ -390,6 +390,37 @@ func (s *OracleLagStrategy) ScanOpportunities(ctx context.Context) (<-chan Oppor
 					return
 				}
 
+				// Pre-flight price check: skip dead/invalid markets before paying the cost
+				// of an IEM API call. ~70% of eligible markets are already resolved
+				// (one side near zero). Checking prices first avoids ~62k IEM calls/3-days.
+				yesPrice := s.getCurrentPrice(m, "YES")
+				noPrice := s.getCurrentPrice(m, "NO")
+
+				if yesPrice <= 0 || noPrice <= 0 {
+					utils.Logger.Infof("SKIP [invalid_prices] %q: YES=$%.2f NO=$%.2f", m.Question, yesPrice, noPrice)
+					localSkip("invalid_prices")
+					return
+				}
+
+				if yesPrice < 0.05 || noPrice < 0.05 {
+					utils.Logger.Debugf("SKIP [dead_market] %q: YES=$%.2f NO=$%.2f (one side near zero)", m.Question, yesPrice, noPrice)
+					localSkip("dead_market")
+					return
+				}
+
+				// Skip markets >2h past resolution still priced near 50/50 — broken/stuck market.
+				staleCutoff := m.ResolutionTimestamp.Add(2 * time.Hour)
+				if time.Now().After(staleCutoff) {
+					const staleLow = 0.40
+					const staleHigh = 0.60
+					if yesPrice >= staleLow && yesPrice <= staleHigh &&
+						noPrice >= staleLow && noPrice <= staleHigh {
+						utils.Logger.Infof("SKIP [stale_market] %q: resolution+2h passed, prices still near 50/50 (YES=$%.2f NO=$%.2f)", m.Question, yesPrice, noPrice)
+						localSkip("stale_market")
+						return
+					}
+				}
+
 				// Get appropriate resolver
 				category := s.monitor.CategorizeMarket(m)
 				resolver := s.factory.GetResolver(category)
@@ -425,34 +456,6 @@ func (s *OracleLagStrategy) ScanOpportunities(ctx context.Context) (<-chan Oppor
 					utils.Logger.Infof("SKIP [low_confidence] %q via %s: confidence=%.1f%% (need >=66%%)", m.Question, resolverName, confidence*100)
 					localSkip("low_confidence")
 					return
-				}
-
-				yesPrice := s.getCurrentPrice(m, "YES")
-				noPrice := s.getCurrentPrice(m, "NO")
-
-				if yesPrice <= 0 || noPrice <= 0 {
-					utils.Logger.Infof("SKIP [invalid_prices] %q: YES=$%.2f NO=$%.2f", m.Question, yesPrice, noPrice)
-					localSkip("invalid_prices")
-					return
-				}
-
-				if yesPrice < 0.05 || noPrice < 0.05 {
-					utils.Logger.Infof("SKIP [dead_market] %q: YES=$%.2f NO=$%.2f (one side near zero)", m.Question, yesPrice, noPrice)
-					localSkip("dead_market")
-					return
-				}
-
-				// Skip markets >2h past resolution still priced near 50/50 — broken/stuck market.
-				staleCutoff := m.ResolutionTimestamp.Add(2 * time.Hour)
-				if time.Now().After(staleCutoff) {
-					const staleLow = 0.40
-					const staleHigh = 0.60
-					if yesPrice >= staleLow && yesPrice <= staleHigh &&
-						noPrice >= staleLow && noPrice <= staleHigh {
-						utils.Logger.Infof("SKIP [stale_market] %q: resolution+2h passed, prices still near 50/50 (YES=$%.2f NO=$%.2f)", m.Question, yesPrice, noPrice)
-						localSkip("stale_market")
-						return
-					}
 				}
 
 				bestOutcome := *outcome
@@ -668,10 +671,14 @@ func (s *OracleLagStrategy) ExecuteOpportunity(ctx context.Context, opp Opportun
 	positionSize := s.calculatePositionSize(opp.Confidence, opp.Edge, balance, opp.MarketQuestion)
 	if isReEntry {
 		positionSize *= ReEntryPositionMultiplier
-		if positionSize < 1.0 {
-			positionSize = 1.0
+		if positionSize < 5.0 {
+			// Polymarket minimum order is $5. Rather than reject the re-entry entirely,
+			// floor it at $5 so the order actually fills. For base trades < $10 this means
+			// the re-entry will exceed 50% of the original size — acceptable given the
+			// improved entry price that triggered the re-entry.
+			positionSize = 5.0
 		}
-		utils.Logger.Infof("🔄 Re-entry position size: $%.2f (50%% of normal)", positionSize)
+		utils.Logger.Infof("🔄 Re-entry position size: $%.2f (50%% of normal, min $5)", positionSize)
 	}
 
 	// Enforce 5-share minimum: compute shares from current price and bump positionSize if needed.
@@ -883,9 +890,9 @@ func (s *OracleLagStrategy) calculatePositionSize(confidence float64, edge float
 	// Combine multipliers
 	finalSize := baseSize * confidenceMultiplier * edgeMultiplier
 
-	// Ensure minimum of $1 (actual share minimum is enforced at order time)
-	if finalSize < 1.0 && finalSize > 0 {
-		finalSize = 1.0
+	// Ensure minimum of $5 — Polymarket rejects orders below this threshold.
+	if finalSize < 5.0 && finalSize > 0 {
+		finalSize = 5.0
 	}
 
 	// Rain markets are capped at RainMaxPosition for testing
@@ -1152,8 +1159,10 @@ func (s *OracleLagStrategy) CheckAndClaimPositions(ctx context.Context) (*Redemp
 				pos.ID, pos.MarketQuestion, pos.Outcome, pos.PositionSize)
 
 			// Notify circuit breaker of the realized loss so daily loss limits are enforced.
-			if err := s.circuitBreaker.RecordTrade(-pos.PositionSize); err != nil {
-				utils.Logger.Errorf("Circuit breaker error after loss: %v", err)
+			// Use RecordLoss (not RecordTrade) to avoid double-counting this trade toward
+			// the daily trade limit — it was already counted when the order was placed.
+			if err := s.circuitBreaker.RecordLoss(-pos.PositionSize); err != nil {
+				utils.Logger.Errorf("Circuit breaker tripped on loss: %v", err)
 			}
 
 			go s.recordLearning(pos, false)
