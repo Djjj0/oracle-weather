@@ -667,8 +667,8 @@ func (s *OracleLagStrategy) ExecuteOpportunity(ctx context.Context, opp Opportun
 		}
 	}
 
-	// Calculate position size based on edge, confidence, live balance, and market question
-	positionSize := s.calculatePositionSize(opp.Confidence, opp.Edge, balance, opp.MarketQuestion)
+	// Calculate position size using half-Kelly criterion
+	positionSize := s.calculatePositionSize(opp.Confidence, opp.CurrentPrice, balance, opp.MarketQuestion)
 	if isReEntry {
 		positionSize *= ReEntryPositionMultiplier
 		if positionSize < 5.0 {
@@ -829,73 +829,60 @@ func (s *OracleLagStrategy) ExecuteOpportunity(ctx context.Context, opp Opportun
 	return nil
 }
 
-// calculatePositionSize determines position size based on available balance, confidence, and edge.
-// baseSize is derived from balance * PositionSizePct, capped at MaxPositionSize.
-// If balance is <= 0 (e.g. fetch failed), falls back to MaxPositionSize.
-// Rain markets are hard-capped at RainMaxPosition (default $1.00) for testing.
-// Formula: baseSize * confidenceMultiplier * edgeMultiplier
-func (s *OracleLagStrategy) calculatePositionSize(confidence float64, edge float64, balance float64, marketQuestion string) float64 {
-	var baseSize float64
+// calculatePositionSize uses the half-Kelly criterion to size each position.
+//
+// Kelly formula for a binary market:
+//
+//	f* = (confidence - price) / (1 - price)
+//
+// where price is the cost per share and 1.0 is the payout on a winning share.
+// We use half-Kelly (f = f*/2) to reduce variance while preserving the
+// proportional sizing benefit: higher-confidence, lower-priced bets get larger
+// allocations automatically, without needing hand-tuned bracket multipliers.
+//
+// The result is capped at MaxPositionSize and floored at $5 (Polymarket minimum).
+// Rain markets retain their hard cap for testing.
+//
+// If balance is unavailable (<= 0), falls back to MaxPositionSize.
+func (s *OracleLagStrategy) calculatePositionSize(confidence, currentPrice float64, balance float64, marketQuestion string) float64 {
+	// Guard: Kelly is undefined or negative when confidence <= price.
+	// This shouldn't reach here (edge filter blocks it earlier), but be safe.
+	if currentPrice <= 0 || currentPrice >= 1.0 || confidence <= currentPrice {
+		return 0
+	}
+
+	// Half-Kelly fraction of bankroll.
+	// f* = (confidence - price) / (1 - price)
+	// f_half = f* / 2
+	kellyFull := (confidence - currentPrice) / (1.0 - currentPrice)
+	kellyHalf := kellyFull / 2.0
+
+	// Determine available capital.
+	var availableBalance float64
 	if balance > 0 {
-		baseSize = balance * s.config.PositionSizePct
-		// Never exceed the configured hard cap
-		if baseSize > s.config.MaxPositionSize {
-			baseSize = s.config.MaxPositionSize
-		}
+		availableBalance = balance
 	} else {
-		// Fallback when live balance is unavailable
-		baseSize = s.config.MaxPositionSize
+		// Fallback: no live balance — use MaxPositionSize directly.
+		utils.Logger.Debugf("Kelly sizing: no live balance, using MaxPositionSize fallback")
+		return s.config.MaxPositionSize
 	}
 
-	// Confidence multiplier
-	var confidenceMultiplier float64
-	switch {
-	case confidence >= 0.95:
-		// Very high confidence (95%+): 100%
-		confidenceMultiplier = 1.0
-	case confidence >= 0.85:
-		// High confidence (85-95%): 95%
-		confidenceMultiplier = 0.95
-	case confidence >= 0.75:
-		// Medium-high confidence (75-85%): 85%
-		confidenceMultiplier = 0.85
-	case confidence >= 0.66:
-		// Medium confidence (66-75%): 75%
-		confidenceMultiplier = 0.75
-	default:
-		// Below minimum confidence threshold: no trade (shouldn't reach here)
-		return 0
+	finalSize := availableBalance * kellyHalf
+
+	// Hard cap: never exceed MaxPositionSize per trade regardless of Kelly output.
+	if finalSize > s.config.MaxPositionSize {
+		finalSize = s.config.MaxPositionSize
 	}
 
-	// Edge multiplier - scale position by edge strength
-	var edgeMultiplier float64
-	switch {
-	case edge >= 0.25:
-		// Huge edge (25%+): full size
-		edgeMultiplier = 1.0
-	case edge >= 0.15:
-		// Large edge (15-25%): 95%
-		edgeMultiplier = 0.95
-	case edge >= 0.10:
-		// Good edge (10-15%): 85%
-		edgeMultiplier = 0.85
-	case edge >= s.config.MinProfitThreshold:
-		// Minimum edge (threshold-10%): 65%
-		edgeMultiplier = 0.65
-	default:
-		// Below threshold (shouldn't reach here due to earlier filter)
-		return 0
-	}
-
-	// Combine multipliers
-	finalSize := baseSize * confidenceMultiplier * edgeMultiplier
+	utils.Logger.Infof("📐 Kelly sizing: conf=%.0f%% price=$%.2f → f*=%.1f%% half-f=%.1f%% → $%.2f (balance=$%.2f cap=$%.2f)",
+		confidence*100, currentPrice, kellyFull*100, kellyHalf*100, finalSize, availableBalance, s.config.MaxPositionSize)
 
 	// Ensure minimum of $5 — Polymarket rejects orders below this threshold.
 	if finalSize < 5.0 && finalSize > 0 {
 		finalSize = 5.0
 	}
 
-	// Rain markets are capped at RainMaxPosition for testing
+	// Rain markets are capped at RainMaxPosition for testing.
 	if strings.Contains(strings.ToLower(marketQuestion), "rain") {
 		rainCap := s.config.RainMaxPosition
 		if rainCap <= 0 {
