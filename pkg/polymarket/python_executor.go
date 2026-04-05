@@ -112,18 +112,71 @@ func PlaceOrderViaPython(ctx context.Context, tokenID string, price, size float6
 	return &response, nil
 }
 
-// PlaceMarketOrderPython is a convenience wrapper for market orders
-func PlaceMarketOrderPython(ctx context.Context, tokenID string, price, size float64) error {
+// PlaceMarketOrderPython places a BUY order and returns the order ID and fill status.
+// status will be "live" if the order is resting in the book, or "matched" if filled immediately.
+func PlaceMarketOrderPython(ctx context.Context, tokenID string, price, size float64) (orderID string, status string, err error) {
 	resp, err := PlaceOrderViaPython(ctx, tokenID, price, size, "BUY")
 	if err != nil {
-		return err
+		return "", "", err
 	}
-
 	if !resp.Success {
-		return fmt.Errorf("order placement failed: %s", resp.Error)
+		return "", "", fmt.Errorf("order placement failed: %s", resp.Error)
+	}
+	return resp.OrderID, resp.Status, nil
+}
+
+// CancelOrderViaPython cancels an open order by its Polymarket order ID.
+func CancelOrderViaPython(ctx context.Context, orderID string) error {
+	type cancelRequest struct {
+		OrderID string `json:"order_id"`
+	}
+	reqJSON, err := json.Marshal(cancelRequest{OrderID: orderID})
+	if err != nil {
+		return fmt.Errorf("failed to marshal cancel request: %w", err)
 	}
 
-	return nil
+	exePath, _ := filepath.Abs(filepath.Join("scripts", "cancel_order.py"))
+
+	pythonExe := "python"
+	if path, err := exec.LookPath("python"); err == nil {
+		pythonExe = path
+	} else if path, err := exec.LookPath("python3"); err == nil {
+		pythonExe = path
+	}
+
+	cmdCtx, cancel := context.WithTimeout(ctx, 90*time.Second)
+	defer cancel()
+
+	cmd := exec.CommandContext(cmdCtx, pythonExe, exePath, string(reqJSON))
+	cmd.Env = append(cmd.Environ(), "PYTHONUNBUFFERED=1")
+
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+
+	utils.Logger.Debugf("Cancelling order via Python SDK: orderID=%s", orderID)
+
+	start := time.Now()
+	_ = cmd.Run()
+	duration := time.Since(start)
+
+	var response PythonOrderResponse
+	if stdout.Len() > 0 {
+		if err := json.Unmarshal(stdout.Bytes(), &response); err != nil {
+			return fmt.Errorf("failed to parse cancel response: %w (output: %s)", err, stdout.String())
+		}
+	} else {
+		if stderr.Len() > 0 {
+			utils.Logger.Errorf("Cancel script stderr: %s", stderr.String())
+		}
+		return fmt.Errorf("cancel script produced no output (orderID=%s)", orderID)
+	}
+
+	if response.Success {
+		utils.Logger.Infof("🚫 Order cancelled via Python SDK (%.0fms): OrderID=%s", duration.Milliseconds(), orderID)
+		return nil
+	}
+	return fmt.Errorf("cancel failed: %s", response.Error)
 }
 
 // RedeemPositionViaPython redeems a resolved winning position on-chain via

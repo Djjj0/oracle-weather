@@ -576,17 +576,25 @@ func (s *OracleLagStrategy) ExecuteOpportunity(ctx context.Context, opp Opportun
 	existingPositions, dbErr := database.GetPositionsByMarket(s.db, opp.MarketID)
 	if dbErr == nil {
 		for _, p := range existingPositions {
-			if strings.EqualFold(p.Outcome, opp.Outcome) && p.Status == "OPEN" {
-				priceImprovement := p.EntryPrice - opp.CurrentPrice
-				if priceImprovement < minPriceImprovementForReEntry {
-					utils.Logger.Infof("⏭️  Skipping - already have open position for %s %s at $%.2f, current $%.2f (improvement %.2f < %.0f%%)",
-						opp.MarketQuestion, opp.Outcome, p.EntryPrice, opp.CurrentPrice,
-						priceImprovement, minPriceImprovementForReEntry*100)
-					return nil
-				}
-				utils.Logger.Infof("📈 Price improved %.0f%% since entry ($%.2f → $%.2f), adding to position",
-					priceImprovement*100, p.EntryPrice, opp.CurrentPrice)
+			if p.Status != "OPEN" {
+				continue
 			}
+			// Never place an order for the opposite side — that locks in a loss.
+			if !strings.EqualFold(p.Outcome, opp.Outcome) {
+				utils.Logger.Warnf("⛔ Skipping %s %s — already hold opposite position (%s) on this market",
+					opp.MarketQuestion, opp.Outcome, p.Outcome)
+				return nil
+			}
+			// Same outcome: skip unless price has improved materially.
+			priceImprovement := p.EntryPrice - opp.CurrentPrice
+			if priceImprovement < minPriceImprovementForReEntry {
+				utils.Logger.Infof("⏭️  Skipping - already have open position for %s %s at $%.2f, current $%.2f (improvement %.2f < %.0f%%)",
+					opp.MarketQuestion, opp.Outcome, p.EntryPrice, opp.CurrentPrice,
+					priceImprovement, minPriceImprovementForReEntry*100)
+				return nil
+			}
+			utils.Logger.Infof("📈 Price improved %.0f%% since entry ($%.2f → $%.2f), adding to position",
+				priceImprovement*100, p.EntryPrice, opp.CurrentPrice)
 		}
 	}
 
@@ -706,13 +714,14 @@ func (s *OracleLagStrategy) ExecuteOpportunity(ctx context.Context, opp Opportun
 	// PlaceMarketOrder / CreateOrder expects size in USDC dollars, not shares (Fix #3).
 	maxRetries := 3
 	var orderErr error
+	var placedOrderID, placedOrderStatus string
 	for attempt := 1; attempt <= maxRetries; attempt++ {
 		// Recompute shares from the current (possibly updated) price each attempt.
 		sharesAmount := positionSize / opp.CurrentPrice
 		utils.Logger.Debugf("Order attempt %d/%d: price=$%.4f size=$%.2f shares=%.2f",
 			attempt, maxRetries, opp.CurrentPrice, positionSize, sharesAmount)
 
-		orderErr = s.client.PlaceMarketOrder(opp.TokenID, opp.CurrentPrice, positionSize)
+		placedOrderID, placedOrderStatus, orderErr = s.client.PlaceMarketOrder(opp.TokenID, opp.CurrentPrice, positionSize)
 		if orderErr == nil {
 			// Success!
 			break
@@ -767,7 +776,13 @@ func (s *OracleLagStrategy) ExecuteOpportunity(ctx context.Context, opp Opportun
 		}
 	}
 
-	utils.Logger.Infof("✅ Order placed successfully")
+	isLiveOrder := strings.EqualFold(placedOrderStatus, "live") || strings.EqualFold(placedOrderStatus, "open")
+	if isLiveOrder {
+		utils.Logger.Infof("⏳ Order submitted but resting in book (status=%s, orderID=%s) — will cancel if unfilled after 10 minutes",
+			placedOrderStatus, placedOrderID)
+	} else {
+		utils.Logger.Infof("✅ Order placed and matched (status=%s, orderID=%s)", placedOrderStatus, placedOrderID)
+	}
 
 	// Flip the Executed flag on the logged opportunity record now that the order succeeded.
 	if opp.DBOpportunityID > 0 {
@@ -775,7 +790,6 @@ func (s *OracleLagStrategy) ExecuteOpportunity(ctx context.Context, opp Opportun
 			utils.Logger.Warnf("Failed to mark opportunity #%d as executed: %v", opp.DBOpportunityID, err)
 		}
 	}
-
 
 	// Record open position
 	position := database.Position{
@@ -785,13 +799,31 @@ func (s *OracleLagStrategy) ExecuteOpportunity(ctx context.Context, opp Opportun
 		Outcome:        opp.Outcome,
 		EntryPrice:     opp.CurrentPrice,
 		PositionSize:   positionSize,
+		OrderID:        placedOrderID,
 	}
 
+	var positionID uint64
 	if err := database.OpenPosition(s.db, position); err != nil {
 		utils.Logger.Errorf("Failed to record position: %v", err)
 	} else {
 		shares := positionSize / opp.CurrentPrice
 		utils.Logger.Infof("📊 Position recorded: %.2f shares @ $%.2f", shares, opp.CurrentPrice)
+		// Retrieve the ID so we can cancel it later if needed.
+		if positions, err := database.GetPositionsByMarket(s.db, opp.MarketID); err == nil {
+			for _, p := range positions {
+				if p.Status == "OPEN" && p.OrderID == placedOrderID {
+					positionID = p.ID
+					break
+				}
+			}
+		}
+	}
+
+	// If the order is resting unfilled, launch a watchdog goroutine that cancels
+	// it after 10 minutes and removes the in-memory execution record so the
+	// opportunity can be re-evaluated on the next scan cycle.
+	if isLiveOrder && placedOrderID != "" && positionID != 0 {
+		go s.watchAndCancelOrder(placedOrderID, positionID, opp.MarketID, opp.Outcome, opp.MarketQuestion)
 	}
 
 	// Log trade to database
@@ -827,6 +859,54 @@ func (s *OracleLagStrategy) ExecuteOpportunity(ctx context.Context, opp Opportun
 	}
 
 	return nil
+}
+
+// watchAndCancelOrder waits 10 minutes and cancels the order if it is still
+// resting unfilled in the Polymarket order book. Once cancelled the position
+// is marked CANCELLED in the database and the in-memory execution record is
+// removed so the scanner can re-evaluate the opportunity on the next cycle.
+func (s *OracleLagStrategy) watchAndCancelOrder(orderID string, positionID uint64, marketID, outcome, question string) {
+	const openOrderTimeout = 10 * time.Minute
+	utils.Logger.Infof("⏱️  Open-order watchdog started for %s %s (orderID=%s, timeout=%s)",
+		question, outcome, orderID, openOrderTimeout)
+
+	timer := time.NewTimer(openOrderTimeout)
+	defer timer.Stop()
+	<-timer.C
+
+	// Check whether the position is still OPEN (it may have been filled and
+	// updated externally, e.g. by a future fill-reconciliation loop).
+	positions, err := database.GetPositionsByMarket(s.db, marketID)
+	if err == nil {
+		for _, p := range positions {
+			if p.ID == positionID && p.Status != "OPEN" {
+				utils.Logger.Infof("⏱️  Watchdog: position %d is no longer OPEN (status=%s) — skipping cancel",
+					positionID, p.Status)
+				return
+			}
+		}
+	}
+
+	utils.Logger.Warnf("⏱️  Watchdog: order %s still unfilled after %s — cancelling", orderID, openOrderTimeout)
+
+	if err := s.client.CancelOrder(orderID); err != nil {
+		utils.Logger.Errorf("⏱️  Watchdog: failed to cancel order %s: %v", orderID, err)
+		// Don't clean up in-memory state — leave the block in place so we don't
+		// accidentally re-enter while the order status is unknown.
+		return
+	}
+
+	if err := database.CancelPosition(s.db, positionID); err != nil {
+		utils.Logger.Errorf("⏱️  Watchdog: failed to mark position %d as CANCELLED: %v", positionID, err)
+	}
+
+	// Remove the in-memory execution record so the next scan can re-evaluate.
+	s.executedTrades.mu.Lock()
+	delete(s.executedTrades.trades, marketID+":"+outcome)
+	s.executedTrades.mu.Unlock()
+
+	utils.Logger.Infof("⏱️  Watchdog: order %s cancelled and position %d marked CANCELLED — market will be re-evaluated on next scan",
+		orderID, positionID)
 }
 
 // calculatePositionSize uses the half-Kelly criterion to size each position.

@@ -707,9 +707,15 @@ func (c *PolymarketClientLixv) GetOrderbook(tokenID string) (*Orderbook, error) 
 	return orderbook, nil
 }
 
-// PlaceMarketOrder places a market buy order using Python SDK
-func (c *PolymarketClientLixv) PlaceMarketOrder(tokenID string, price, size float64) error {
+// PlaceMarketOrder places a market buy order using Python SDK.
+// Returns (orderID, status, error). status is "live" for resting orders, "matched" for immediate fills.
+func (c *PolymarketClientLixv) PlaceMarketOrder(tokenID string, price, size float64) (string, string, error) {
 	return PlaceMarketOrderPython(context.Background(), tokenID, price, size)
+}
+
+// CancelOrder cancels an open order by its Polymarket order ID.
+func (c *PolymarketClientLixv) CancelOrder(orderID string) error {
+	return CancelOrderViaPython(context.Background(), orderID)
 }
 
 // PlaceSellOrder places a sell order using Python SDK

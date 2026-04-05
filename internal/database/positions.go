@@ -23,7 +23,8 @@ type Position struct {
 	PositionSize   float64   `json:"position_size"` // Amount invested in $
 	Shares         float64   `json:"shares"`        // Number of shares bought
 	EntryTime      time.Time `json:"entry_time"`
-	Status         string    `json:"status"` // "OPEN", "CLAIMED", "LOST"
+	Status         string    `json:"status"` // "OPEN", "CLAIMED", "LOST", "CANCELLED"
+	OrderID        string    `json:"order_id,omitempty"` // Polymarket order ID (for cancellation)
 	ExitPrice      float64   `json:"exit_price"`
 	Profit         float64   `json:"profit"`
 	ClaimedAt      time.Time `json:"claimed_at"`
@@ -232,6 +233,58 @@ func GetAllClosedPositions(db *bolt.DB) ([]Position, error) {
 	}
 
 	return positions, nil
+}
+
+// UpdatePositionOrderID stores the Polymarket order ID on an existing position record.
+// Called immediately after order placement so we can cancel it later if needed.
+func UpdatePositionOrderID(db *bolt.DB, positionID uint64, orderID string) error {
+	return db.Update(func(tx *bolt.Tx) error {
+		b := tx.Bucket(positionsBucket)
+		if b == nil {
+			return fmt.Errorf("positions bucket not found")
+		}
+		v := b.Get(itob(positionID))
+		if v == nil {
+			return fmt.Errorf("position not found: %d", positionID)
+		}
+		var pos Position
+		if err := json.Unmarshal(v, &pos); err != nil {
+			return fmt.Errorf("failed to decode position: %w", err)
+		}
+		pos.OrderID = orderID
+		encoded, err := json.Marshal(pos)
+		if err != nil {
+			return fmt.Errorf("failed to encode position: %w", err)
+		}
+		return b.Put(itob(positionID), encoded)
+	})
+}
+
+// CancelPosition marks a position as CANCELLED (unfilled order was withdrawn).
+// The position will be treated as if it never existed so the opportunity can
+// be re-evaluated on the next scan cycle.
+func CancelPosition(db *bolt.DB, positionID uint64) error {
+	return db.Update(func(tx *bolt.Tx) error {
+		b := tx.Bucket(positionsBucket)
+		if b == nil {
+			return fmt.Errorf("positions bucket not found")
+		}
+		v := b.Get(itob(positionID))
+		if v == nil {
+			return fmt.Errorf("position not found: %d", positionID)
+		}
+		var pos Position
+		if err := json.Unmarshal(v, &pos); err != nil {
+			return fmt.Errorf("failed to decode position: %w", err)
+		}
+		pos.Status = "CANCELLED"
+		pos.ClaimedAt = time.Now()
+		encoded, err := json.Marshal(pos)
+		if err != nil {
+			return fmt.Errorf("failed to encode position: %w", err)
+		}
+		return b.Put(itob(positionID), encoded)
+	})
 }
 
 // GetTotalExposure calculates total $ exposure across all open positions
