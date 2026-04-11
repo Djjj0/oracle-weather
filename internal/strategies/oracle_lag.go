@@ -667,6 +667,36 @@ func (s *OracleLagStrategy) ExecuteOpportunity(ctx context.Context, opp Opportun
 		}
 	}
 
+	// FIX A — Cross-market adjacent-bucket conflict guard.
+	// The same-market-ID guard above only catches conflicts within one market.
+	// Buenos Aires March 9 audit: bot held NO on 28°C AND YES on 27°C simultaneously
+	// (different market IDs, same city/date). At 28°C actual, both lost — $19.50 double loss.
+	// isBucketAdjacent() existed but was never called. Wire it up here.
+	//
+	// Rule: if we already hold an open position on any temperature market for the same
+	// city/date, and that market's bucket is adjacent to this one, skip — the positions
+	// create a scenario where both can lose simultaneously (only 1 exact temp pays both).
+	if city := extractCityFromQuestion(opp.MarketQuestion); city != "" {
+		newBucket := parseBucketFromQuestion(opp.MarketQuestion)
+		if newBucket != nil {
+			cityPositions, cityErr := database.GetPositionsByCity(s.db, city)
+			if cityErr == nil {
+				for _, cp := range cityPositions {
+					if cp.Status != "OPEN" {
+						continue
+					}
+					existingBucket := parseBucketFromQuestion(cp.MarketQuestion)
+					if isBucketAdjacent(newBucket, existingBucket) {
+						utils.Logger.Warnf("⛔ Skipping %q (%s) — adjacent bucket conflict with open position %q (%s). "+
+							"Holding both creates a double-loss scenario if actual temp lands between buckets.",
+							opp.MarketQuestion, opp.Outcome, cp.MarketQuestion, cp.Outcome)
+						return nil
+					}
+				}
+			}
+		}
+	}
+
 	utils.Logger.Infof("💰 Executing opportunity: %s", opp.MarketQuestion)
 
 	// Validate opportunity still exists - PHASE 7: Fresh data check

@@ -508,16 +508,23 @@ func (w *IEMWeatherResolver) determineOutcomeWithPeak(data *MarketData, runningH
 	roundedHigh := math.Round(runningHigh)
 
 	// pastPeak (+1h): gate for NO bets and range/below YES bets.
-	// earlyPeak (+0.5h): gate for exact-match YES bets — temp has been stable
-	// long enough to be confident, but we don't need the full 1h.
-	// Both give IEM time to record the actual peak observation.
+	// earlyPeak (+1.5h): gate for exact-match YES bets — raised from +0.5h to +1.5h
+	// after audit showed premature YES bets on Amsterdam (11°C→12°C actual),
+	// Seattle (55°F range→57°F actual), Chicago (56-57°F→65°F actual), and
+	// Buenos Aires (27°C→28°C actual). 30-minute buffer was insufficient on days
+	// when temperatures peak late; 1.5h gives a full hour of post-peak stability.
 	pastPeak := currentHour >= typicalPeakHour+1.0
-	earlyPeak := currentHour >= typicalPeakHour+0.5
+	earlyPeak := currentHour >= typicalPeakHour+1.5
 
 	switch data.Condition {
 	case "temperature_above":
-		if roundedHigh >= data.Threshold {
-			// Already exceeded — safe YES bet any time
+		// FIX C — require ≥1°C margin before firing YES on temperature_above.
+		// Previously roundedHigh >= threshold was sufficient, meaning a transient
+		// METAR spike of exactly threshold (e.g. 17°C on Moscow Apr 1) would trigger
+		// YES even if the true daily peak turned out to be 1°C lower (actual: 16°C).
+		// A 1°C floor matches checkObviousYes and guards against station noise/rounding.
+		if roundedHigh >= data.Threshold && (runningHigh-data.Threshold) >= 1.0 {
+			// Exceeded threshold with sufficient margin — safe YES bet any time
 			return "Yes", marginToConfidence(runningHigh-data.Threshold)
 		}
 		if pastPeak {
