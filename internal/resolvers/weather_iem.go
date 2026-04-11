@@ -106,7 +106,10 @@ var cityToAirport = map[string]string{
 	"sydney":         "YSSY",
 	"melbourne":      "YMML",
 	"singapore":      "WSSS",
-	"hong kong":      "VHHH", // HK International Airport — Polymarket resolves via Wunderground VHHH (HKO-operated airport station)
+	// "hong kong": "VHHH", // BLACKLISTED 2026-04-11: VHHH (Chek Lap Kok airport) reads
+	// 2-4°C below HKO urban observatory that Polymarket uses for resolution.
+	// All HK positions resolved LOST during forensic audit (Apr 4-11). Re-enable only
+	// after confirming the correct station against Polymarket's resolution methodology.
 	"beijing":        "ZBAA",
 	"shanghai":       "ZSPD",
 	"dubai":          "OMDB",

@@ -154,8 +154,15 @@ func (pc *PositionCloser) closePosition(pos database.Position, currentPrice floa
 		utils.Logger.Errorf("Failed to log trade: %v", err)
 	}
 
-	// Mark position as claimed (closed)
-	if err := database.ClaimPosition(pc.db, pos.ID, currentPrice); err != nil {
+	// FIX #6 — closePosition always passed currentPrice (0 for resolved markets) to
+	// ClaimPosition, causing ClaimPosition to compute profit = shares*0 - positionSize
+	// = negative, even for winning positions. The correct exit price for a resolved
+	// winning position is $1.00/share (full payout). Pass 1.0 when market is resolved.
+	claimExitPrice := currentPrice
+	if currentPrice == 0 {
+		claimExitPrice = 1.0 // resolved market: payout is $1.00/share for winning positions
+	}
+	if err := database.ClaimPosition(pc.db, pos.ID, claimExitPrice); err != nil {
 		utils.Logger.Errorf("Failed to mark position as closed: %v", err)
 	}
 

@@ -34,6 +34,9 @@ const (
 	ReEntryPositionMultiplier = 0.5
 	// SlippageBuffer accounts for estimated price impact of a market buy order
 	SlippageBuffer = 0.05
+	// MaxCityExposure caps total open exposure per city to limit losses from bad data sources.
+	// A single faulty IEM station (e.g. HK VHHH) caused ~$98 in losses with no city-level limit.
+	MaxCityExposure = 30.0
 )
 
 // tradeRecord stores metadata about a trade for re-entry tracking
@@ -110,6 +113,49 @@ func (et *ExecutedTrades) RecordExecution(marketID, outcome string, isReEntry bo
 			delete(et.trades, k)
 		}
 	}
+}
+
+// TryReserveExecution atomically checks whether execution should proceed and
+// reserves the slot to prevent concurrent goroutine races. Returns (proceed, isReEntry).
+//
+// For new slots: inserts a placeholder record under write-lock, returns (true, false).
+// For valid re-entry window (MinReExecutionDelay–ReEntryHardLimit): returns (true, true)
+//   without modifying firstTradeTime so the re-entry window is measured from the original trade.
+// For blocked (too soon, or re-entry already used): returns (false, false).
+//
+// The caller MUST call ReleaseExecution on any error path and RecordExecution on success.
+func (et *ExecutedTrades) TryReserveExecution(marketID, outcome string) (proceed bool, isReEntry bool) {
+	et.mu.Lock()
+	defer et.mu.Unlock()
+
+	key := marketID + ":" + outcome
+	rec, exists := et.trades[key]
+
+	if !exists {
+		// New slot — insert placeholder atomically so no concurrent goroutine races through.
+		et.trades[key] = tradeRecord{firstTradeTime: time.Now()}
+		return true, false
+	}
+
+	elapsed := time.Since(rec.firstTradeTime)
+	if elapsed < MinReExecutionDelay || rec.reEntryDone {
+		return false, false // blocked: too soon, or re-entry window already consumed
+	}
+	if elapsed > ReEntryHardLimit {
+		// Past hard limit — reset as a fresh trade.
+		et.trades[key] = tradeRecord{firstTradeTime: time.Now()}
+		return true, false
+	}
+	// Valid re-entry window — preserve firstTradeTime so the window is measured correctly.
+	return true, true
+}
+
+// ReleaseExecution removes a reserved slot. Call on error paths after TryReserveExecution
+// so the market can be re-evaluated on the next scan cycle.
+func (et *ExecutedTrades) ReleaseExecution(marketID, outcome string) {
+	et.mu.Lock()
+	defer et.mu.Unlock()
+	delete(et.trades, marketID+":"+outcome)
 }
 
 // ScanResult holds statistics from a single scan cycle
@@ -568,9 +614,32 @@ func (s *OracleLagStrategy) ExecuteOpportunity(ctx context.Context, opp Opportun
 		return fmt.Errorf("circuit breaker tripped: %s", reason)
 	}
 
-	// Check DB for existing open position on this market — survives restarts.
+	// FIX #1 — Race condition: atomically reserve the execution slot BEFORE the DB check.
+	// Previously, two goroutines scanning the same market concurrently both called
+	// GetPositionsByMarket, both saw "no open position", and both placed orders (duplicate
+	// positions confirmed in logs: 2026-04-05T02:17:33Z Jakarta double-entry).
+	// TryReserveExecution uses a write-lock so only one goroutine can claim the slot.
+	shouldProceed, isReEntry := s.executedTrades.TryReserveExecution(opp.MarketID, opp.Outcome)
+	if !shouldProceed {
+		utils.Logger.Infof("⏭️  Skipping - already executing or recently executed %s %s", opp.MarketQuestion, opp.Outcome)
+		return nil
+	}
+	// Release the reservation on any error-path return so future scans can re-evaluate.
+	// On success, RecordExecution finalises the slot (e.g. sets reEntryDone for re-entries).
+	reservationReleased := false
+	defer func() {
+		if !reservationReleased {
+			s.executedTrades.ReleaseExecution(opp.MarketID, opp.Outcome)
+		}
+	}()
+	if isReEntry {
+		utils.Logger.Infof("🔄 Re-entry detected for %s — will use 50%% position size", opp.MarketQuestion)
+	}
+
+	// DB check — safe from goroutine race since the slot is now reserved above.
+	// Check for existing open position on this market — survives process restarts.
 	// Skip if we already hold a position at a similar or worse price.
-	// Allow re-entry only if current price is >10% better than our entry
+	// Allow adding to position only if current price is >10% better than our entry
 	// (e.g. we bought NO at 80¢, now it's at 65¢ — materially better entry).
 	const minPriceImprovementForReEntry = 0.10
 	existingPositions, dbErr := database.GetPositionsByMarket(s.db, opp.MarketID)
@@ -596,18 +665,6 @@ func (s *OracleLagStrategy) ExecuteOpportunity(ctx context.Context, opp Opportun
 			utils.Logger.Infof("📈 Price improved %.0f%% since entry ($%.2f → $%.2f), adding to position",
 				priceImprovement*100, p.EntryPrice, opp.CurrentPrice)
 		}
-	}
-
-	// In-memory check for duplicate / re-entry within this session
-	tradeStatus := s.executedTrades.CheckTradeStatus(opp.MarketID, opp.Outcome)
-	isReEntry := false
-	switch tradeStatus {
-	case TradeStatusBlocked:
-		utils.Logger.Infof("⏭️  Skipping - already executed this opportunity within last hour")
-		return nil
-	case TradeStatusReEntry:
-		isReEntry = true
-		utils.Logger.Infof("🔄 Re-entry detected for %s — will use 50%% position size", opp.MarketQuestion)
 	}
 
 	utils.Logger.Infof("💰 Executing opportunity: %s", opp.MarketQuestion)
@@ -671,6 +728,29 @@ func (s *OracleLagStrategy) ExecuteOpportunity(ctx context.Context, opp Opportun
 			balance -= exposure
 			if balance < 0 {
 				balance = 0
+			}
+		}
+	}
+
+	// FIX #4 — Per-city exposure cap: prevent runaway losses when a single city's data
+	// source is faulty. Without this, HK accumulated ~$98.79 across 14+ positions on a
+	// wrong station ID before the audit caught it.
+	if city := extractCityFromQuestion(opp.MarketQuestion); city != "" {
+		cityPositions, cityErr := database.GetPositionsByCity(s.db, city)
+		if cityErr == nil {
+			var cityExposure float64
+			for _, cp := range cityPositions {
+				if cp.Status == "OPEN" {
+					cityExposure += cp.PositionSize
+				}
+			}
+			if cityExposure >= MaxCityExposure {
+				utils.Logger.Warnf("⛔ City exposure cap reached for %q: $%.2f >= $%.2f — skipping",
+					city, cityExposure, MaxCityExposure)
+				return fmt.Errorf("city exposure cap reached for %s: $%.2f", city, cityExposure)
+			}
+			if cityExposure > 0 {
+				utils.Logger.Infof("City exposure for %q: $%.2f / $%.2f", city, cityExposure, MaxCityExposure)
 			}
 		}
 	}
@@ -847,8 +927,10 @@ func (s *OracleLagStrategy) ExecuteOpportunity(ctx context.Context, opp Opportun
 		return fmt.Errorf("circuit breaker error: %w", err)
 	}
 
-	// Record execution to prevent duplicates / track re-entry
+	// Finalise execution record: marks slot as permanently taken and sets reEntryDone
+	// for re-entries. Signal defer not to release the reservation.
 	s.executedTrades.RecordExecution(opp.MarketID, opp.Outcome, isReEntry)
+	reservationReleased = true
 
 	// Send notification if configured
 	if s.config.DiscordWebhookURL != "" {
@@ -900,13 +982,16 @@ func (s *OracleLagStrategy) watchAndCancelOrder(orderID string, positionID uint6
 		utils.Logger.Errorf("⏱️  Watchdog: failed to mark position %d as CANCELLED: %v", positionID, err)
 	}
 
-	// Remove the in-memory execution record so the next scan can re-evaluate.
+	// FIX #3 — Watchdog re-entry: reset firstTradeTime to now so the normal
+	// MinReExecutionDelay (1h) gate blocks re-entry on the same thesis.
+	// Previously this deleted the key entirely, making the next scan treat the cancelled
+	// market as a brand-new opportunity and re-enter on the same potentially-wrong thesis.
 	s.executedTrades.mu.Lock()
-	delete(s.executedTrades.trades, marketID+":"+outcome)
+	s.executedTrades.trades[marketID+":"+outcome] = tradeRecord{firstTradeTime: time.Now()}
 	s.executedTrades.mu.Unlock()
 
-	utils.Logger.Infof("⏱️  Watchdog: order %s cancelled and position %d marked CANCELLED — market will be re-evaluated on next scan",
-		orderID, positionID)
+	utils.Logger.Infof("⏱️  Watchdog: order %s cancelled, position %d marked CANCELLED — re-entry blocked for %s",
+		orderID, positionID, MinReExecutionDelay)
 }
 
 // calculatePositionSize uses the half-Kelly criterion to size each position.
@@ -1161,10 +1246,21 @@ func (s *OracleLagStrategy) CheckAndClaimPositions(ctx context.Context) (*Redemp
 						strings.Contains(redeemResp.Error, "403") ||
 						strings.Contains(redeemResp.Error, "Forbidden")
 					if alreadyGone {
-						utils.Logger.Warnf("⚠️  Position #%d (%s): tokens already redeemed or no on-chain balance — closing position",
+						utils.Logger.Warnf("⚠️  Position #%d (%s): tokens already redeemed by Polymarket auto-redemption — recording win",
 							pos.ID, pos.MarketQuestion)
-						database.ClaimPosition(s.db, pos.ID, 1.0)
-						result.Wins++ // tokens were already claimed; record as win
+						// FIX #5 — P&L accounting: previously result.Wins was incremented but
+						// result.TotalProfit was not updated, causing all auto-redeemed wins to
+						// show $0 in internal accounting (confirmed: 13 wins = $0 in bot DB,
+						// but wallet grew $221.54 → $264.58 via Polymarket auto-redemption).
+						if err := database.ClaimPosition(s.db, pos.ID, 1.0); err != nil {
+							utils.Logger.Errorf("Failed to record auto-redeemed win for position #%d: %v", pos.ID, err)
+						} else {
+							autoProfit := pos.Shares - pos.PositionSize
+							result.Wins++
+							result.TotalProfit += autoProfit
+							utils.Logger.Infof("🏆 AUTO-REDEEMED WIN #%d: %s | Profit: $%.2f (recorded)",
+								pos.ID, pos.MarketQuestion, autoProfit)
+						}
 						continue
 					}
 					utils.Logger.Errorf("On-chain redemption rejected for position #%d (%s): %s — will retry next cycle",

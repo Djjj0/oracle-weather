@@ -3,6 +3,7 @@ package database
 import (
 	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
 
 	bolt "go.etcd.io/bbolt"
@@ -285,6 +286,38 @@ func CancelPosition(db *bolt.DB, positionID uint64) error {
 		}
 		return b.Put(itob(positionID), encoded)
 	})
+}
+
+// GetPositionsByCity retrieves positions whose MarketQuestion contains the city name.
+// Used by the per-city exposure cap to prevent runaway losses on bad data sources.
+func GetPositionsByCity(db *bolt.DB, city string) ([]Position, error) {
+	var positions []Position
+	cityLower := strings.ToLower(city)
+
+	err := db.View(func(tx *bolt.Tx) error {
+		b := tx.Bucket(positionsBucket)
+		if b == nil {
+			return nil
+		}
+
+		c := b.Cursor()
+		for k, v := c.First(); k != nil; k, v = c.Next() {
+			var pos Position
+			if err := json.Unmarshal(v, &pos); err != nil {
+				continue
+			}
+			if strings.Contains(strings.ToLower(pos.MarketQuestion), cityLower) {
+				positions = append(positions, pos)
+			}
+		}
+		return nil
+	})
+
+	if err != nil {
+		return nil, err
+	}
+
+	return positions, nil
 }
 
 // GetTotalExposure calculates total $ exposure across all open positions
