@@ -507,14 +507,16 @@ func (w *IEMWeatherResolver) checkObviousYes(data *MarketData, runningHigh float
 func (w *IEMWeatherResolver) determineOutcomeWithPeak(data *MarketData, runningHigh float64, unitSymbol string, currentHour, typicalPeakHour float64) (string, float64) {
 	roundedHigh := math.Round(runningHigh)
 
-	// pastPeak (+1h): gate for NO bets and range/below YES bets.
-	// earlyPeak (+1.5h): gate for exact-match YES bets — raised from +0.5h to +1.5h
-	// after audit showed premature YES bets on Amsterdam (11°C→12°C actual),
-	// Seattle (55°F range→57°F actual), Chicago (56-57°F→65°F actual), and
-	// Buenos Aires (27°C→28°C actual). 30-minute buffer was insufficient on days
-	// when temperatures peak late; 1.5h gives a full hour of post-peak stability.
+	// pastPeak (+1h): gate for NO bets on above/below/exact and YES bets on below/range.
+	// earlyPeak (+1.5h): gate for exact-match YES bets — raised from +0.5h after audit
+	// showed premature YES bets (Amsterdam 11→12°C, Seattle 55→57°F, Chicago 56-57→65°F).
+	// latePeak (+2h): gate for temperature_range NO bets only — raised from +1.0h after
+	// Seattle Apr 11 audit: running high was 53°F (below 54°F floor) at typicalPeak+1h,
+	// bot bet NO, but actual peak arrived at typicalPeak+2h (54°F). The extra hour ensures
+	// the temperature has genuinely stopped rising before committing to a below-floor NO.
 	pastPeak := currentHour >= typicalPeakHour+1.0
 	earlyPeak := currentHour >= typicalPeakHour+1.5
+	latePeak := currentHour >= typicalPeakHour+2.0
 
 	switch data.Condition {
 	case "temperature_above":
@@ -592,10 +594,12 @@ func (w *IEMWeatherResolver) determineOutcomeWithPeak(data *MarketData, runningH
 			// Already above range ceiling — safe NO any time
 			return "No", marginToConfidence(runningHigh-tempHigh)
 		}
-		if pastPeak && roundedHigh < tempLow {
-			// Past peak and below floor — won't reach range, bet NO
+		if latePeak && roundedHigh < tempLow {
+			// 2h past peak and still below floor — won't reach range, bet NO.
+			// Uses latePeak (+2h) not pastPeak (+1h): Seattle Apr 11 showed temp
+			// can rise into range up to 2h after typical peak on warm afternoons.
 			margin := tempLow - runningHigh
-			peakMarginBonus := math.Min((currentHour-typicalPeakHour-1.0)*0.05, 0.10)
+			peakMarginBonus := math.Min((currentHour-typicalPeakHour-2.0)*0.05, 0.10)
 			return "No", math.Min(marginToConfidence(margin)+peakMarginBonus, 0.98)
 		}
 	}
