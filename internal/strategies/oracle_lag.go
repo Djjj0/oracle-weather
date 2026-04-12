@@ -808,8 +808,8 @@ func (s *OracleLagStrategy) ExecuteOpportunity(ctx context.Context, opp Opportun
 		utils.Logger.Infof("Position bumped to 5-share minimum (cost: $%.2f at price $%.2f)", positionSize, opp.CurrentPrice)
 	}
 
-	utils.Logger.Infof("Position size: $%.2f (%.0f%% of max due to %.1f%% confidence, %.1f%% edge)",
-		positionSize, (positionSize/s.config.MaxPositionSize)*100, opp.Confidence*100, opp.Edge*100)
+	utils.Logger.Infof("Position size: $%.2f (conf=%.1f%% edge=%.1f%%)",
+		positionSize, opp.Confidence*100, opp.Edge*100)
 
 	// PHASE 7: Check gas price profitability
 	shouldExecute, reason := s.client.ShouldExecuteTrade(opp.ExpectedProfit, positionSize)
@@ -1035,10 +1035,13 @@ func (s *OracleLagStrategy) watchAndCancelOrder(orderID string, positionID uint6
 // proportional sizing benefit: higher-confidence, lower-priced bets get larger
 // allocations automatically, without needing hand-tuned bracket multipliers.
 //
-// The result is capped at MaxPositionSize and floored at $5 (Polymarket minimum).
-// Rain markets retain their hard cap for testing.
+// The result is floored at $5 (Polymarket minimum). No flat cap is applied —
+// half-Kelly itself limits stakes to at most ~50% of bankroll, and the gas
+// profitability check (ShouldExecuteTrade) acts as the fee-aware floor.
+// Rain markets retain their own separate cap for testing.
 //
-// If balance is unavailable (<= 0), falls back to MaxPositionSize.
+// If balance is unavailable (<= 0), returns $5 (the Polymarket minimum) and
+// logs a warning — better to skip than to bet an arbitrary uncalibrated amount.
 func (s *OracleLagStrategy) calculatePositionSize(confidence, currentPrice float64, balance float64, marketQuestion string) float64 {
 	// Guard: Kelly is undefined or negative when confidence <= price.
 	// This shouldn't reach here (edge filter blocks it earlier), but be safe.
@@ -1049,6 +1052,9 @@ func (s *OracleLagStrategy) calculatePositionSize(confidence, currentPrice float
 	// Half-Kelly fraction of bankroll.
 	// f* = (confidence - price) / (1 - price)
 	// f_half = f* / 2
+	//
+	// No flat cap — half-Kelly naturally limits any single bet to <50% of bankroll.
+	// Fee profitability is enforced downstream by ShouldExecuteTrade (gas check).
 	kellyFull := (confidence - currentPrice) / (1.0 - currentPrice)
 	kellyHalf := kellyFull / 2.0
 
@@ -1057,20 +1063,15 @@ func (s *OracleLagStrategy) calculatePositionSize(confidence, currentPrice float
 	if balance > 0 {
 		availableBalance = balance
 	} else {
-		// Fallback: no live balance — use MaxPositionSize directly.
-		utils.Logger.Debugf("Kelly sizing: no live balance, using MaxPositionSize fallback")
-		return s.config.MaxPositionSize
+		// No live balance available — return minimum rather than betting blind.
+		utils.Logger.Warnf("Kelly sizing: no live balance available, defaulting to $5 minimum")
+		return 5.0
 	}
 
 	finalSize := availableBalance * kellyHalf
 
-	// Hard cap: never exceed MaxPositionSize per trade regardless of Kelly output.
-	if finalSize > s.config.MaxPositionSize {
-		finalSize = s.config.MaxPositionSize
-	}
-
-	utils.Logger.Infof("📐 Kelly sizing: conf=%.0f%% price=$%.2f → f*=%.1f%% half-f=%.1f%% → $%.2f (balance=$%.2f cap=$%.2f)",
-		confidence*100, currentPrice, kellyFull*100, kellyHalf*100, finalSize, availableBalance, s.config.MaxPositionSize)
+	utils.Logger.Infof("📐 Kelly sizing: conf=%.0f%% price=$%.2f → f*=%.1f%% half-f=%.1f%% → $%.2f (%.1f%% of $%.2f balance)",
+		confidence*100, currentPrice, kellyFull*100, kellyHalf*100, finalSize, kellyHalf*100, availableBalance)
 
 	// Ensure minimum of $5 — Polymarket rejects orders below this threshold.
 	if finalSize < 5.0 && finalSize > 0 {
