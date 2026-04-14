@@ -473,6 +473,9 @@ func (w *IEMWeatherResolver) checkObviousNo(data *MarketData, runningHigh float6
 		tempHigh := data.Extra["temp_high"].(float64)
 		// Running high already above range ceiling — NO is certain
 		if roundedHigh > tempHigh {
+			if runningHigh-tempHigh < 1.5 {
+				return false, 0 // Too close to ceiling — station variance could flip result
+			}
 			return true, marginToConfidence(runningHigh - tempHigh)
 		}
 	case "temperature_above":
@@ -585,6 +588,9 @@ func (w *IEMWeatherResolver) determineOutcomeWithPeak(data *MarketData, runningH
 			if pastPeak {
 				// In range and past peak — YES
 				margin := math.Min(runningHigh-tempLow, tempHigh-runningHigh)
+				if margin < 1.5 {
+					return "", 0 // Too close to range edge — station variance could push outside
+				}
 				return "Yes", marginToConfidence(margin)
 			}
 			// In range but not past peak — could still go higher and exit range
@@ -592,6 +598,9 @@ func (w *IEMWeatherResolver) determineOutcomeWithPeak(data *MarketData, runningH
 		}
 		if roundedHigh > tempHigh {
 			// Already above range ceiling — safe NO any time
+			if runningHigh-tempHigh < 1.5 {
+				return "", 0 // Too close to ceiling — station variance could flip result
+			}
 			return "No", marginToConfidence(runningHigh-tempHigh)
 		}
 		if latePeak && roundedHigh < tempLow {
