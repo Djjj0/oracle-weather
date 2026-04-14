@@ -599,8 +599,8 @@ func (w *IEMWeatherResolver) determineOutcomeWithPeak(data *MarketData, runningH
 			// Uses latePeak (+2h) not pastPeak (+1h): Seattle Apr 11 showed temp
 			// can rise into range up to 2h after typical peak on warm afternoons.
 			margin := tempLow - runningHigh
-			if margin < 2.0 {
-				// Too close to the range floor — a 1°F/°C gap is within station
+			if margin < 1.5 {
+				// Too close to the range floor — a ≤1°F/°C gap is within station
 				// variance and afternoon creep. NYC Apr 13 (77°F→79°F) and LA Apr 13
 				// (65°F→66°F) both lost ~$80 combined because a 1°F margin triggered
 				// 90% confidence NO bets that flipped YES within hours. Skip.
