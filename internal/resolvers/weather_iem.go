@@ -535,6 +535,12 @@ func (w *IEMWeatherResolver) determineOutcomeWithPeak(data *MarketData, runningH
 		if pastPeak {
 			// Past peak and still below — won't recover, bet NO
 			margin := data.Threshold - runningHigh
+			if margin < 1.5 {
+				// Too close to threshold — within station variance and late-day creep.
+				// Moscow Apr 4 (13°C → 14°C) lost $0.97 on a 1°C margin NO bet that
+				// flipped YES within hours of "peak". Skip anything within 1.5°.
+				return "", 0
+			}
 			// Extra confidence the further past peak we are
 			peakMarginBonus := math.Min((currentHour-typicalPeakHour-1.0)*0.05, 0.10)
 			return "No", math.Min(marginToConfidence(margin)+peakMarginBonus, 0.98)
@@ -564,20 +570,28 @@ func (w *IEMWeatherResolver) determineOutcomeWithPeak(data *MarketData, runningH
 			return "No", marginToConfidence(runningHigh - data.Threshold)
 		}
 		if earlyPeak {
-			if roundedHigh == data.Threshold {
-				// Past early-peak and running high matches exactly — bet YES.
-				// earlyPeak (+0.5h) is sufficient: temp has settled and won't
-				// climb further in the next 30 minutes. Use pastPeak bonus.
-				peakMarginBonus := math.Min((currentHour-typicalPeakHour-0.5)*0.05, 0.10)
-				return "Yes", math.Min(0.80+peakMarginBonus, 0.92)
-			}
 			// Past peak and still below — won't reach exact value, bet NO.
+			// (YES path moved to latePeak below — too many losses at earlyPeak:
+			// Toronto 6°C Apr 12, Taipei 26°C Apr 8, Istanbul 16°C Apr 3 all resolved
+			// differently because the temperature continued rising 1-2°C after earlyPeak.)
 			margin := data.Threshold - runningHigh
-			if margin < 2.0 {
-				return "", 0 // Too close to boundary — skip
+			if margin < 2.5 {
+				// Tightened from 2.0 to 2.5: Taipei Apr 6 had exactly 2°C margin
+				// (26°C running vs 28°C threshold) which the old < 2.0 guard passed;
+				// the temperature rose the full 2°C and resolved YES. Skip anything
+				// under 2.5° to give a full degree of buffer above the old boundary.
+				return "", 0
 			}
 			peakMarginBonus := math.Min((currentHour-typicalPeakHour-1.0)*0.05, 0.10)
 			return "No", math.Min(marginToConfidence(margin)+peakMarginBonus, 0.98)
+		}
+		if latePeak && roundedHigh == data.Threshold {
+			// Past late-peak (+2h) and running high matches exactly — safe YES.
+			// Moved from earlyPeak to latePeak after audit: temp regularly rises
+			// 1-2°C in the 30-60 min after earlyPeak, turning exact-match YES bets
+			// into losses. At latePeak the day's trajectory is truly locked in.
+			peakMarginBonus := math.Min((currentHour-typicalPeakHour-2.0)*0.05, 0.10)
+			return "Yes", math.Min(0.80+peakMarginBonus, 0.92)
 		}
 		return "", 0
 
