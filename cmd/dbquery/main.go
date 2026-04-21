@@ -10,11 +10,77 @@ import (
 )
 
 func main() {
-	if len(os.Args) > 1 && os.Args[1] == "reset" {
-		resetCities()
-		return
+	if len(os.Args) > 1 {
+		switch os.Args[1] {
+		case "reset":
+			resetCities()
+			return
+		case "purge-anomalies":
+			purgeAnomalies()
+			return
+		case "dedupe":
+			dedupeHistory()
+			return
+		case "clean":
+			// Convenience: run purge + dedupe + refresh stats in one pass.
+			dedupeHistory()
+			purgeAnomalies()
+			return
+		}
 	}
 	queryCities()
+}
+
+func forEachDB(fn func(name string, db *pkgweather.LearningDB)) {
+	dbs := []struct{ name, path string }{
+		{"US", "./data/learning.db"},
+		{"International", "./data/learning_international.db"},
+	}
+	for _, d := range dbs {
+		db, err := pkgweather.NewLearningDB(d.path)
+		if err != nil {
+			fmt.Printf("Error opening %s: %v\n", d.name, err)
+			continue
+		}
+		fn(d.name, db)
+		db.Close()
+	}
+}
+
+func purgeAnomalies() {
+	forEachDB(func(name string, db *pkgweather.LearningDB) {
+		n, cities, err := db.PurgeAnomalousRows()
+		if err != nil {
+			fmt.Printf("[%s] purge error: %v\n", name, err)
+			return
+		}
+		fmt.Printf("[%s] purged %d anomalous rows across %d cities: %v\n",
+			name, n, len(cities), cities)
+		for _, c := range cities {
+			if err := db.UpdateCityStats(c); err != nil {
+				fmt.Printf("  [%s] UpdateCityStats(%s): %v\n", name, c, err)
+			} else {
+				fmt.Printf("  [%s] refreshed %s\n", name, c)
+			}
+		}
+	})
+}
+
+func dedupeHistory() {
+	forEachDB(func(name string, db *pkgweather.LearningDB) {
+		n, cities, err := db.DedupeMarketHistory()
+		if err != nil {
+			fmt.Printf("[%s] dedupe error: %v\n", name, err)
+			return
+		}
+		fmt.Printf("[%s] deduped %d duplicate rows across %d cities: %v\n",
+			name, n, len(cities), cities)
+		for _, c := range cities {
+			if err := db.UpdateCityStats(c); err != nil {
+				fmt.Printf("  [%s] UpdateCityStats(%s): %v\n", name, c, err)
+			}
+		}
+	})
 }
 
 func queryCities() {

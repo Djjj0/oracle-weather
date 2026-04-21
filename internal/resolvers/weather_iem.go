@@ -3,6 +3,7 @@ package resolvers
 import (
 	"fmt"
 	"math"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -13,6 +14,16 @@ import (
 	"github.com/djbro/oracle-weather/pkg/utils"
 	pkgweather "github.com/djbro/oracle-weather/pkg/weather"
 	"github.com/go-resty/resty/v2"
+)
+
+// Peak-hour sanity bounds for daytime temperature maxima.
+// Any "peak" outside this local-hour window is a cold-front artifact (midnight
+// max before a morning freeze) or a data anomaly and must not be used to train
+// the learner. Chicago's learner was poisoned to avg_peak=7.46 by 00:51 local
+// "peaks" on cold-front days; filtering here prevents recurrence.
+const (
+	peakHourMinLocal = 9  // earliest a legitimate daytime peak can occur
+	peakHourMaxLocal = 22 // latest a legitimate daytime peak can occur (exclusive)
 )
 
 // cacheTTL is the maximum age of a cached IEM result before it is evicted and re-fetched.
@@ -419,10 +430,21 @@ func (w *IEMWeatherResolver) fetchOnDemandPeakHour(city, station, timezone strin
 
 	now := time.Now().UTC()
 	var peakHours []float64
+	var rejected int
 	for i := 1; i <= 5; i++ {
 		date := now.AddDate(0, 0, -i)
 		peakHour, peakTemp, err := pkgweather.FetchDailyPeak(station, date, loc)
 		if err != nil {
+			continue
+		}
+		// Reject cold-front-day midnight "peaks" (e.g. Chicago 00:51 CDT) and
+		// other sub-9AM or post-10PM artifacts. These are not real daytime
+		// maxima and will pull avg_high_temp_hour toward zero. Skip both the
+		// DB write and the in-memory aggregation.
+		if peakHour < peakHourMinLocal || peakHour >= peakHourMaxLocal {
+			rejected++
+			utils.Logger.Debugf("IEM on-demand: rejecting anomalous peak for %s on %s: %.2f local (outside [%d,%d))",
+				city, date.Format("2006-01-02"), peakHour, peakHourMinLocal, peakHourMaxLocal)
 			continue
 		}
 		localDate := date.In(loc)
@@ -441,16 +463,23 @@ func (w *IEMWeatherResolver) fetchOnDemandPeakHour(city, station, timezone strin
 	}
 
 	if len(peakHours) == 0 {
-		utils.Logger.Warnf("IEM on-demand: no data fetched for %s (%s)", city, station)
+		utils.Logger.Warnf("IEM on-demand: no valid peak data for %s (%s) — %d rejected as anomalous",
+			city, station, rejected)
 		return -1
 	}
 
-	var sum float64
-	for _, h := range peakHours {
-		sum += h
+	// Use median, not mean. Robust to residual outliers that slip past the
+	// sanity filter above and to station-outage days with freak morning peaks.
+	sort.Float64s(peakHours)
+	var computed float64
+	n := len(peakHours)
+	if n%2 == 1 {
+		computed = peakHours[n/2]
+	} else {
+		computed = (peakHours[n/2-1] + peakHours[n/2]) / 2.0
 	}
-	computed := sum / float64(len(peakHours))
-	utils.Logger.Infof("IEM on-demand peak hour for %s: %.1f (from %d days)", city, computed, len(peakHours))
+	utils.Logger.Infof("IEM on-demand peak hour for %s: %.1f (median of %d days, %d rejected)",
+		city, computed, n, rejected)
 	return computed
 }
 
@@ -517,9 +546,20 @@ func (w *IEMWeatherResolver) determineOutcomeWithPeak(data *MarketData, runningH
 	// Seattle Apr 11 audit: running high was 53°F (below 54°F floor) at typicalPeak+1h,
 	// bot bet NO, but actual peak arrived at typicalPeak+2h (54°F). The extra hour ensures
 	// the temperature has genuinely stopped rising before committing to a below-floor NO.
-	pastPeak := currentHour >= typicalPeakHour+1.0
-	earlyPeak := currentHour >= typicalPeakHour+1.5
-	latePeak := currentHour >= typicalPeakHour+2.0
+	//
+	// Hard floor on effective peak: no real daytime max occurs before 13:00 local.
+	// If the learner returns an earlier value, it's either under-sampled or poisoned
+	// (Chicago Apr 2026: cold-front midnight "peaks" pulled avg to 7.46, causing
+	// latePeak=09:28 and premature NO bets on 80-81°F ranges at 10:35 AM). Clamping
+	// here ensures temperature_range NO bets cannot fire before 15:00 local regardless
+	// of what the learner says.
+	effectivePeakHour := typicalPeakHour
+	if effectivePeakHour < 13.0 {
+		effectivePeakHour = 13.0
+	}
+	pastPeak := currentHour >= effectivePeakHour+1.0
+	earlyPeak := currentHour >= effectivePeakHour+1.5
+	latePeak := currentHour >= effectivePeakHour+2.0
 
 	switch data.Condition {
 	case "temperature_above":
@@ -542,8 +582,8 @@ func (w *IEMWeatherResolver) determineOutcomeWithPeak(data *MarketData, runningH
 				return "", 0
 			}
 			// Extra confidence the further past peak we are
-			peakMarginBonus := math.Min((currentHour-typicalPeakHour-1.0)*0.05, 0.10)
-			return "No", math.Min(marginToConfidence(margin)+peakMarginBonus, 0.98)
+			peakMarginBonus := math.Min((currentHour-effectivePeakHour-1.0)*0.05, 0.10)
+			return "No", math.Min(marginToConfidence(margin)+peakMarginBonus, 0.92)
 		}
 
 	case "temperature_below":
@@ -559,8 +599,8 @@ func (w *IEMWeatherResolver) determineOutcomeWithPeak(data *MarketData, runningH
 			if margin < 1.0 {
 				return "", 0
 			}
-			peakMarginBonus := math.Min((currentHour-typicalPeakHour-1.0)*0.05, 0.10)
-			return "Yes", math.Min(marginToConfidence(margin)+peakMarginBonus, 0.98)
+			peakMarginBonus := math.Min((currentHour-effectivePeakHour-1.0)*0.05, 0.10)
+			return "Yes", math.Min(marginToConfidence(margin)+peakMarginBonus, 0.92)
 		}
 
 	case "temperature_exact":
@@ -582,15 +622,15 @@ func (w *IEMWeatherResolver) determineOutcomeWithPeak(data *MarketData, runningH
 				// under 2.5° to give a full degree of buffer above the old boundary.
 				return "", 0
 			}
-			peakMarginBonus := math.Min((currentHour-typicalPeakHour-1.0)*0.05, 0.10)
-			return "No", math.Min(marginToConfidence(margin)+peakMarginBonus, 0.98)
+			peakMarginBonus := math.Min((currentHour-effectivePeakHour-1.0)*0.05, 0.10)
+			return "No", math.Min(marginToConfidence(margin)+peakMarginBonus, 0.92)
 		}
 		if latePeak && roundedHigh == data.Threshold {
 			// Past late-peak (+2h) and running high matches exactly — safe YES.
 			// Moved from earlyPeak to latePeak after audit: temp regularly rises
 			// 1-2°C in the 30-60 min after earlyPeak, turning exact-match YES bets
 			// into losses. At latePeak the day's trajectory is truly locked in.
-			peakMarginBonus := math.Min((currentHour-typicalPeakHour-2.0)*0.05, 0.10)
+			peakMarginBonus := math.Min((currentHour-effectivePeakHour-2.0)*0.05, 0.10)
 			return "Yes", math.Min(0.80+peakMarginBonus, 0.92)
 		}
 		return "", 0
@@ -629,8 +669,8 @@ func (w *IEMWeatherResolver) determineOutcomeWithPeak(data *MarketData, runningH
 				// 90% confidence NO bets that flipped YES within hours. Skip.
 				return "", 0
 			}
-			peakMarginBonus := math.Min((currentHour-typicalPeakHour-2.0)*0.05, 0.10)
-			return "No", math.Min(marginToConfidence(margin)+peakMarginBonus, 0.98)
+			peakMarginBonus := math.Min((currentHour-effectivePeakHour-2.0)*0.05, 0.10)
+			return "No", math.Min(marginToConfidence(margin)+peakMarginBonus, 0.92)
 		}
 	}
 
@@ -745,19 +785,23 @@ func (w *IEMWeatherResolver) getIEMHighTemp(station string, date time.Time, cels
 
 // marginToConfidence converts degrees of margin from a threshold to a confidence value.
 // The further the actual temperature is from the decision boundary, the more confident we are.
+//
+// Capped at 0.90: the old 0.98 tier fed Kelly sizing at ~94% fraction, producing
+// 47%-of-bankroll single bets (Chicago Apr 21 −$21.06 on poisoned learner data).
+// 0.90 keeps half-Kelly below ~40% even at extreme prices, and the per-bet dollar
+// cap in oracle_lag.calculatePositionSize is the final backstop.
 func marginToConfidence(marginDegrees float64) float64 {
 	switch {
 	case marginDegrees >= 3.0:
-		return 0.98
-	case marginDegrees >= 2.0:
-		return 0.95
-	case marginDegrees >= 1.0:
 		return 0.90
-	case marginDegrees >= 0.5:
+	case marginDegrees >= 2.0:
+		return 0.85
+	case marginDegrees >= 1.0:
 		return 0.80
+	case marginDegrees >= 0.5:
+		return 0.72
 	default:
-		// Very close to boundary — rounding or station variance could flip the result
-		return 0.70
+		return 0.65
 	}
 }
 

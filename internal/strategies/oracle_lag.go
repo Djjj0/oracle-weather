@@ -786,7 +786,13 @@ func (s *OracleLagStrategy) ExecuteOpportunity(ctx context.Context, opp Opportun
 	}
 
 	// Calculate position size using half-Kelly criterion
-	positionSize := s.calculatePositionSize(opp.Confidence, opp.CurrentPrice, balance, opp.MarketQuestion)
+	positionSize := s.calculatePositionSize(opp.Confidence, opp.CurrentPrice, balance, opp.MarketQuestion, opp.Outcome)
+	if positionSize <= 0 {
+		// calculatePositionSize returned 0 → skip (insufficient balance, cap
+		// below $5 minimum, or invalid confidence/price). Not an error.
+		utils.Logger.Infof("⏭️  Skipping trade: position sizing returned $0 (caps below $5 min or unavailable balance)")
+		return nil
+	}
 	if isReEntry {
 		positionSize *= ReEntryPositionMultiplier
 		if positionSize < 5.0 {
@@ -1024,61 +1030,45 @@ func (s *OracleLagStrategy) watchAndCancelOrder(orderID string, positionID uint6
 		orderID, positionID, MinReExecutionDelay)
 }
 
-// calculatePositionSize uses the half-Kelly criterion to size each position.
+// calculatePositionSize uses half-Kelly with hard caps at 10% of bankroll and
+// $10 per trade.
 //
 // Kelly formula for a binary market:
 //
 //	f* = (confidence - price) / (1 - price)
 //
 // where price is the cost per share and 1.0 is the payout on a winning share.
-// We use half-Kelly (f = f*/2) to reduce variance while preserving the
-// proportional sizing benefit: higher-confidence, lower-priced bets get larger
-// allocations automatically, without needing hand-tuned bracket multipliers.
 //
-// The result is floored at $5 (Polymarket minimum). No flat cap is applied —
-// half-Kelly itself limits stakes to at most ~50% of bankroll, and the gas
-// profitability check (ShouldExecuteTrade) acts as the fee-aware floor.
-// Rain markets retain their own separate cap for testing.
-//
-// If balance is unavailable (<= 0), returns $5 (the Polymarket minimum) and
-// logs a warning — better to skip than to bet an arbitrary uncalibrated amount.
-func (s *OracleLagStrategy) calculatePositionSize(confidence, currentPrice float64, balance float64, marketQuestion string) float64 {
+// Caps: the April 2026 forensic audit showed half-Kelly alone sized single bets
+// at 47% of bankroll (Chicago Apr 21 $21.06 on $44.60 balance) when a poisoned
+// learner produced a false 98% confidence. Until the learner proves clean over
+// a full week, every bet is capped at min(halfKelly*balance, 10% balance, $10).
+// Floored at $5 (Polymarket minimum) — if the cap drops us below $5, skip the
+// trade entirely rather than forcing a $5 bet the cap said was too large.
+func (s *OracleLagStrategy) calculatePositionSize(confidence, currentPrice float64, balance float64, marketQuestion, outcome string) float64 {
 	// Guard: Kelly is undefined or negative when confidence <= price.
-	// This shouldn't reach here (edge filter blocks it earlier), but be safe.
 	if currentPrice <= 0 || currentPrice >= 1.0 || confidence <= currentPrice {
 		return 0
 	}
 
-	// Half-Kelly fraction of bankroll.
-	// f* = (confidence - price) / (1 - price)
-	// f_half = f* / 2
-	//
-	// No flat cap — half-Kelly naturally limits any single bet to <50% of bankroll.
-	// Fee profitability is enforced downstream by ShouldExecuteTrade (gas check).
+	if balance <= 0 {
+		utils.Logger.Warnf("Kelly sizing: no live balance available — skipping trade")
+		return 0
+	}
+
 	kellyFull := (confidence - currentPrice) / (1.0 - currentPrice)
 	kellyHalf := kellyFull / 2.0
+	kellySize := balance * kellyHalf
 
-	// Determine available capital.
-	var availableBalance float64
-	if balance > 0 {
-		availableBalance = balance
-	} else {
-		// No live balance available — return minimum rather than betting blind.
-		utils.Logger.Warnf("Kelly sizing: no live balance available, defaulting to $5 minimum")
-		return 5.0
-	}
+	// Unconditional caps: 10% of bankroll AND $10 absolute.
+	balanceCap := balance * 0.10
+	absoluteCap := 10.0
+	finalSize := math.Min(kellySize, math.Min(balanceCap, absoluteCap))
 
-	finalSize := availableBalance * kellyHalf
+	utils.Logger.Infof("📐 Kelly sizing: conf=%.0f%% price=$%.2f → f*=%.1f%% half-f=%.1f%% → $%.2f capped→$%.2f (%.1f%% of $%.2f balance)",
+		confidence*100, currentPrice, kellyFull*100, kellyHalf*100, kellySize, finalSize, finalSize/balance*100, balance)
 
-	utils.Logger.Infof("📐 Kelly sizing: conf=%.0f%% price=$%.2f → f*=%.1f%% half-f=%.1f%% → $%.2f (%.1f%% of $%.2f balance)",
-		confidence*100, currentPrice, kellyFull*100, kellyHalf*100, finalSize, kellyHalf*100, availableBalance)
-
-	// Ensure minimum of $5 — Polymarket rejects orders below this threshold.
-	if finalSize < 5.0 && finalSize > 0 {
-		finalSize = 5.0
-	}
-
-	// Rain markets are capped at RainMaxPosition for testing.
+	// Rain markets retain their testing cap on top of the universal cap.
 	if strings.Contains(strings.ToLower(marketQuestion), "rain") {
 		rainCap := s.config.RainMaxPosition
 		if rainCap <= 0 {
@@ -1089,6 +1079,18 @@ func (s *OracleLagStrategy) calculatePositionSize(confidence, currentPrice float
 				rainCap, finalSize, marketQuestion)
 			finalSize = rainCap
 		}
+	}
+
+	// Below Polymarket's $5 minimum: skip, do not force-size up to $5.
+	// (Forcing $5 when the cap said $4.46 is allowed would systematically
+	// overbet on small bankrolls — the audit premise is that we'd rather
+	// sit out than overexpose.)
+	if finalSize < 5.0 {
+		// Exception: rain markets allow sub-$5 via their own cap mechanism.
+		if strings.Contains(strings.ToLower(marketQuestion), "rain") {
+			return finalSize
+		}
+		return 0
 	}
 
 	return finalSize
@@ -1162,50 +1164,24 @@ type RedemptionResult struct {
 	Pending    int
 }
 
-// recordLearning writes the resolved market outcome to the learning DB so that
-// OptimalEntryHour is refined over time from actual trade results.
+// recordLearning is intentionally a no-op.
+//
+// Previously this wrote a market_history row with highTempTime = pos.EntryTime
+// and highTemp = 0 — treating the bot's entry timestamp as if it were an
+// observed daytime peak. This poisoned the learner: entries at 09:29 CDT were
+// aggregated into avg_high_temp_hour as if 09:29 were a real high, pulling the
+// city's OptimalEntryHour earlier over time and making future pastPeak gates
+// fire too early (Chicago Apr 21 incident).
+//
+// The only source of truth for high_temp_time is IEM ASOS via
+// fetchOnDemandPeakHour. Closing a position does not reveal WHEN the peak
+// occurred, only whether our bet was correct — and success rate alone is
+// already derivable from bot_trades.db without polluting the learner.
+//
+// Kept as a stub so the existing call sites compile unchanged.
 func (s *OracleLagStrategy) recordLearning(pos database.Position, success bool) {
-	// Extract city from market question (e.g. "Will the highest temperature in London be...")
-	cityRe := regexp.MustCompile(`(?i)in ([A-Za-z\s]+?) (?:be|on)`)
-	city := ""
-	if m := cityRe.FindStringSubmatch(pos.MarketQuestion); len(m) > 1 {
-		city = strings.TrimSpace(m[1])
-	}
-	if city == "" {
-		return
-	}
-
-	ldb := s.factory.LearningDBForCity(city)
-	if ldb == nil {
-		return
-	}
-
-	// Look up timezone for this city
-	var tz string
-	if stats, err := ldb.GetCityStats(strings.ToLower(city)); err == nil {
-		tz = stats.Timezone
-	}
-	if tz == "" {
-		tz = "UTC"
-	}
-
-	// Use position entry time as the "optimal entry" observation point —
-	// over many trades this converges to the real optimal hour.
-	err := ldb.RecordMarketOutcome(
-		pos.MarketID,
-		city,
-		tz,
-		pos.EntryTime, // market date (close enough for daily granularity)
-		0,            // high temp unknown here; leave zero
-		pos.EntryTime,
-		pos.EntryTime,
-		success,
-	)
-	if err != nil {
-		utils.Logger.Debugf("Learning DB update for %s: %v", city, err)
-	} else {
-		utils.Logger.Debugf("Learning DB updated for %s (success=%v)", city, success)
-	}
+	_ = pos
+	_ = success
 }
 
 // CheckAndClaimPositions checks all open positions and claims resolved ones

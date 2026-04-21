@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -15,6 +16,7 @@ import (
 	"github.com/djbro/oracle-weather/internal/strategies"
 	"github.com/djbro/oracle-weather/pkg/polymarket"
 	"github.com/djbro/oracle-weather/pkg/utils"
+	pkgweather "github.com/djbro/oracle-weather/pkg/weather"
 	bolt "go.etcd.io/bbolt"
 	"github.com/sirupsen/logrus"
 )
@@ -106,7 +108,102 @@ func main() {
 	// Run daily P&L report at 8am every morning
 	go runDailyReport(ctx, db, cfg, logger)
 
+	// Run nightly city_stats sanity audit at 7am local
+	go runCityStatsAudit(ctx, cfg, logger)
+
 	runOracleLagStrategy(ctx, strategy, logger, cfg)
+}
+
+// runCityStatsAudit wakes daily at 7am local and scans the learning DBs for
+// cities whose avg_high_temp_hour is outside a plausible daytime window
+// [10.0, 20.0]. Values outside that range indicate the peak-hour learner has
+// been polluted by cold-front-day midnight "peaks" or station glitches — the
+// exact failure mode that drove Chicago's avg to 7.46 and triggered ~$280 of
+// premature temperature_range NO bets. Alerts go to Discord so the operator
+// can quarantine the bad row before the next trading window.
+func runCityStatsAudit(ctx context.Context, cfg *config.Config, logger *logrus.Logger) {
+	for {
+		now := time.Now()
+		next := time.Date(now.Year(), now.Month(), now.Day(), 7, 0, 0, 0, now.Location())
+		if !next.After(now) {
+			next = next.Add(24 * time.Hour)
+		}
+		wait := time.Until(next)
+		logger.Infof("City stats audit scheduled in %s (at %s)", wait.Round(time.Minute), next.Format("2006-01-02 15:04:05"))
+
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(wait):
+		}
+
+		auditCityStats(cfg, logger)
+	}
+}
+
+func auditCityStats(cfg *config.Config, logger *logrus.Logger) {
+	const minHour, maxHour = 10.0, 20.0
+	type finding struct {
+		source  string
+		city    string
+		avgHour float64
+		optHour float64
+		samples int
+	}
+	var bad []finding
+
+	for _, src := range []struct {
+		name string
+		path string
+	}{
+		{"US", "./data/learning.db"},
+		{"INTL", "./data/learning_international.db"},
+	} {
+		ldb, err := pkgweather.NewLearningDB(src.path)
+		if err != nil {
+			logger.Errorf("City stats audit: failed to open %s (%s): %v", src.name, src.path, err)
+			continue
+		}
+		stats, err := ldb.GetAllCityStats()
+		_ = ldb.Close()
+		if err != nil {
+			logger.Errorf("City stats audit: failed to read %s: %v", src.name, err)
+			continue
+		}
+		for _, s := range stats {
+			if s.TotalMarkets >= 3 && (s.AvgHighTempHour < minHour || s.AvgHighTempHour > maxHour) {
+				bad = append(bad, finding{
+					source:  src.name,
+					city:    s.City,
+					avgHour: s.AvgHighTempHour,
+					optHour: s.OptimalEntryHour,
+					samples: s.TotalMarkets,
+				})
+			}
+		}
+	}
+
+	if len(bad) == 0 {
+		logger.Info("City stats audit: all cities within [10.0, 20.0] — OK")
+		return
+	}
+
+	var b strings.Builder
+	b.WriteString("🚨 **City Stats Audit Alert** — suspicious peak-hour values detected\n\n")
+	b.WriteString("These cities have `avg_high_temp_hour` outside [10.0, 20.0] and will likely trigger\n")
+	b.WriteString("premature temperature_range NO bets. Investigate and quarantine the learner row.\n\n")
+	for _, f := range bad {
+		fmt.Fprintf(&b, "• **%s** [%s] — peak=%.2f, optimal_entry=%.2f, samples=%d\n",
+			f.city, f.source, f.avgHour, f.optHour, f.samples)
+	}
+	msg := b.String()
+	logger.Warnf("City stats audit: %d suspicious cities\n%s", len(bad), msg)
+
+	if cfg.DiscordWebhookURL != "" {
+		if err := utils.SendDiscordNotification(cfg.DiscordWebhookURL, msg); err != nil {
+			logger.Errorf("City stats audit: Discord notification failed: %v", err)
+		}
+	}
 }
 
 func runOracleLagStrategy(ctx context.Context, strategy *strategies.OracleLagStrategy, logger *logrus.Logger, cfg *config.Config) {

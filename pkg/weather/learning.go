@@ -3,6 +3,7 @@ package weather
 import (
 	"database/sql"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -148,10 +149,132 @@ func (l *LearningDB) DeleteCityData(city string) error {
 	return nil
 }
 
-// AddMarketPattern adds a historical market pattern
+// PurgeAnomalousRows deletes market_history rows whose high_temp_time, when
+// converted to the row's stored IANA timezone, falls outside the daytime peak
+// window [09:00, 22:00). These rows are cold-front midnight "peaks" or morning
+// data-outage peaks that poison the learner (Chicago Apr 18 00:51 CDT). Returns
+// the count of rows deleted and the list of distinct cities affected (for
+// follow-up UpdateCityStats calls).
+//
+// Implementation note: SQLite's strftime() does not understand IANA tz names,
+// so the filter is applied in Go after loading ids + timestamps.
+func (l *LearningDB) PurgeAnomalousRows() (int64, []string, error) {
+	rows, err := l.db.Query(`SELECT id, city, high_temp_time, timezone, high_temp FROM market_history`)
+	if err != nil {
+		return 0, nil, fmt.Errorf("scan market_history: %w", err)
+	}
+	defer rows.Close()
+
+	var badIDs []int64
+	citySet := map[string]struct{}{}
+	for rows.Next() {
+		var id int64
+		var city, tz string
+		var htt time.Time
+		var highTemp float64
+		if err := rows.Scan(&id, &city, &htt, &tz, &highTemp); err != nil {
+			continue
+		}
+		loc, err := time.LoadLocation(tz)
+		if err != nil {
+			loc = time.UTC
+		}
+		localHour := htt.In(loc).Hour()
+		// Purge if: hour is outside daytime window OR high_temp is zero
+		// (the latter is recordLearning legacy pollution — a position-close
+		// row where entry time was written as if it were a peak observation).
+		if localHour < 9 || localHour >= 22 || highTemp == 0 {
+			badIDs = append(badIDs, id)
+			citySet[city] = struct{}{}
+		}
+	}
+	rows.Close()
+
+	if len(badIDs) == 0 {
+		return 0, nil, nil
+	}
+
+	tx, err := l.db.Begin()
+	if err != nil {
+		return 0, nil, fmt.Errorf("begin tx: %w", err)
+	}
+	stmt, err := tx.Prepare(`DELETE FROM market_history WHERE id = ?`)
+	if err != nil {
+		tx.Rollback()
+		return 0, nil, fmt.Errorf("prepare: %w", err)
+	}
+	var deleted int64
+	for _, id := range badIDs {
+		res, err := stmt.Exec(id)
+		if err != nil {
+			stmt.Close()
+			tx.Rollback()
+			return deleted, nil, fmt.Errorf("delete id=%d: %w", id, err)
+		}
+		if n, _ := res.RowsAffected(); n > 0 {
+			deleted += n
+		}
+	}
+	stmt.Close()
+	if err := tx.Commit(); err != nil {
+		return deleted, nil, fmt.Errorf("commit: %w", err)
+	}
+
+	cities := make([]string, 0, len(citySet))
+	for c := range citySet {
+		cities = append(cities, c)
+	}
+	return deleted, cities, nil
+}
+
+// DedupeMarketHistory collapses rows that share the same (market_id, DATE(date))
+// down to one — keeping the row with the lowest id. Fixes the legacy triple-
+// write pattern where nanosecond-precision on the `date` column bypassed the
+// UNIQUE(market_id, date) constraint on concurrent on-demand fetches.
+// Returns rows deleted and cities affected.
+func (l *LearningDB) DedupeMarketHistory() (int64, []string, error) {
+	selectCities := `
+		SELECT DISTINCT city FROM market_history
+		WHERE id NOT IN (
+			SELECT MIN(id) FROM market_history GROUP BY market_id, DATE(date)
+		)
+	`
+	rows, err := l.db.Query(selectCities)
+	if err != nil {
+		return 0, nil, fmt.Errorf("select affected cities: %w", err)
+	}
+	var cities []string
+	for rows.Next() {
+		var c string
+		if err := rows.Scan(&c); err == nil {
+			cities = append(cities, c)
+		}
+	}
+	rows.Close()
+
+	res, err := l.db.Exec(`
+		DELETE FROM market_history
+		WHERE id NOT IN (
+			SELECT MIN(id) FROM market_history GROUP BY market_id, DATE(date)
+		)
+	`)
+	if err != nil {
+		return 0, cities, fmt.Errorf("dedupe market_history: %w", err)
+	}
+	n, _ := res.RowsAffected()
+	return n, cities, nil
+}
+
+// AddMarketPattern adds a historical market pattern.
+//
+// Uses INSERT OR IGNORE so the UNIQUE(market_id, date) constraint actually
+// suppresses duplicates. Prior INSERT OR REPLACE behavior silently allowed
+// the same (market_id, date) to be written 3× per call in fetchOnDemandPeakHour
+// (see IDs 210/211/212 in learning.db — three rows for the same ondemand key),
+// which triples the weight of every day and amplifies any stray outlier 3×.
 func (l *LearningDB) AddMarketPattern(pattern MarketPattern) error {
 	query := `
-		INSERT OR REPLACE INTO market_history
+		INSERT OR IGNORE INTO market_history
 		(market_id, city, date, timezone, high_temp, high_temp_time,
 		 iem_data_final_time, market_resolved_time, optimal_entry_time,
 		 data_lag_minutes, resolution_lag_minutes, success, notes)
@@ -189,6 +312,19 @@ func (l *LearningDB) GetCityStats(city string) (*CityStats, error) {
 	return &stats, err
 }
 
+// medianSorted returns the median of vs. Sorts vs in place. Returns 0 if empty.
+func medianSorted(vs []float64) float64 {
+	n := len(vs)
+	if n == 0 {
+		return 0
+	}
+	sort.Float64s(vs)
+	if n%2 == 1 {
+		return vs[n/2]
+	}
+	return (vs[n/2-1] + vs[n/2]) / 2.0
+}
+
 // UpdateCityStats recalculates and updates statistics for a city
 func (l *LearningDB) UpdateCityStats(city string) error {
 	// Query to get raw timestamp data - we'll parse it in Go
@@ -205,8 +341,7 @@ func (l *LearningDB) UpdateCityStats(city string) error {
 	}
 	defer rows.Close()
 
-	var total int
-	var sumHighHour, sumIEMHour, sumResolutionHour float64
+	var highHours, iemHours, resolutionHours []float64
 	var successCount int
 	var timezone string
 
@@ -220,39 +355,47 @@ func (l *LearningDB) UpdateCityStats(city string) error {
 			continue
 		}
 
-		// Load timezone location for conversion
 		loc, err := time.LoadLocation(tz)
 		if err != nil {
-			// Fall back to UTC if timezone load fails
 			loc = time.UTC
 		}
 
-		// Convert timestamps to local timezone BEFORE extracting hour
-		localHighTime := highTempTime.In(loc)
-		localIEMTime := iemFinalTime.In(loc)
-		localResolvedTime := marketResolvedTime.In(loc)
+		localHigh := float64(highTempTime.In(loc).Hour()) + float64(highTempTime.In(loc).Minute())/60.0
+		localIEM := float64(iemFinalTime.In(loc).Hour()) + float64(iemFinalTime.In(loc).Minute())/60.0
+		localResolved := float64(marketResolvedTime.In(loc).Hour()) + float64(marketResolvedTime.In(loc).Minute())/60.0
 
-		// Extract hour as float (hour + minutes/60) from LOCAL time
-		sumHighHour += float64(localHighTime.Hour()) + float64(localHighTime.Minute())/60.0
-		sumIEMHour += float64(localIEMTime.Hour()) + float64(localIEMTime.Minute())/60.0
-		sumResolutionHour += float64(localResolvedTime.Hour()) + float64(localResolvedTime.Minute())/60.0
+		// Skip rows whose recorded "high" timestamp is outside the daytime peak
+		// window. These are cold-front midnight "peaks" or data-outage morning
+		// peaks that poison the learner (Chicago Apr 2026 incident: one 00:51
+		// CDT and one 10:50 CDT row pulled avg_high_temp_hour to 6.7, causing
+		// pastPeak to fire at 09:29 CDT and lose $21.06 on a 98%-conf NO-inverse
+		// bet). The sanity window matches peakHourMinLocal/peakHourMaxLocal in
+		// weather_iem.go and is enforced here so legacy bad rows cannot reach
+		// the aggregated stats even if they remain in market_history.
+		if localHigh < 9.0 || localHigh >= 22.0 {
+			continue
+		}
+
+		highHours = append(highHours, localHigh)
+		iemHours = append(iemHours, localIEM)
+		resolutionHours = append(resolutionHours, localResolved)
 
 		if success {
 			successCount++
 		}
-
-		total++
 		timezone = tz
 	}
 
+	total := len(highHours)
 	if total == 0 {
 		return fmt.Errorf("no data found for city: %s", city)
 	}
 
-	// Calculate averages
-	avgHighHour := sumHighHour / float64(total)
-	avgIEMHour := sumIEMHour / float64(total)
-	avgResolutionHour := sumResolutionHour / float64(total)
+	// Use median, not mean — robust to residual outliers (data-outage days,
+	// station errors). One poisoned row no longer determines the stat.
+	avgHighHour := medianSorted(highHours)
+	avgIEMHour := medianSorted(iemHours)
+	avgResolutionHour := medianSorted(resolutionHours)
 	successRate := float64(successCount) / float64(total)
 
 	// Calculate optimal entry time
