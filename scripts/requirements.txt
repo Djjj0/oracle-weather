@@ -1,0 +1,23 @@
+# Python dependencies for oracle-weather trading scripts
+# Install with: pip install -r scripts/requirements.txt
+#
+# These packages are required for order placement (place_order.py, cancel_order.py)
+# and on-chain position redemption (redeem_position.py). Missing packages are the
+# root cause of two P0 incidents:
+#   - April 2 2026: py-clob-client missing → 869 orders failed, ~$50-100 missed
+#   - April 3+ 2026: web3 missing → 60+ redemption failures, bot P&L accounting broken
+
+# Polymarket CLOB client — order placement, API credentials, order book
+py-clob-client>=0.18.0
+
+# Ethereum/Polygon Web3 — on-chain USDC balance, position redemption via CTF contract
+web3>=6.0.0
+
+# eth-account — private key signing, address derivation (also a web3 dep, pinned explicitly)
+eth-account>=0.9.0
+
+# python-dotenv — loads .env for POLYMARKET_PRIVATE_KEY, POLYGON_RPC_URL, etc.
+python-dotenv>=1.0.0
+
+# requests — HTTP calls in check_polymarket_api.py and API helpers
+requests>=2.28.0
