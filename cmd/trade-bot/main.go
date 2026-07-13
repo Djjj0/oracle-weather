@@ -380,7 +380,7 @@ func scanAndExecute(ctx context.Context, strategy *strategies.OracleLagStrategy,
 	if cfg.DiscordWebhookURL != "" {
 		noResolverCount := scanResult.SkipReasons["no_resolver"] + scanResult.SkipReasons["market_filter"]
 		withResolver := scanResult.MarketsScanned - noResolverCount
-		msg := utils.ScanSummaryMessage(scanResult.MarketsScanned, withResolver, scanResult.Opportunities, scanResult.Opportunities, scanResult.SkipReasons)
+		msg := utils.ScanSummaryMessage(scanResult.MarketsScanned, withResolver, scanResult.Opportunities, executed, scanResult.SkipReasons)
 		if err := utils.SendDiscordNotification(cfg.DiscordWebhookURL, msg); err != nil {
 			logger.Errorf("Failed to send scan summary to Discord: %v", err)
 		}
