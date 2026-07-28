@@ -239,9 +239,11 @@ func (pc *PositionCloser) ValidateAndExitBadPositions(ctx context.Context) error
 		shouldExit := false
 
 		if outcome == nil {
-			// Resolver says it's too early to know (pre-peak) — position was placed prematurely
-			exitReason = "placed before peak hour — resolver cannot confirm outcome yet"
-			shouldExit = true
+			// Pre-peak — resolver can't confirm yet. Keep the position.
+			// Only exit when the resolver ACTIVELY returns the opposite outcome.
+			// Selling pre-peak would lock in a loss on positions that may still
+			// resolve correctly after the temperature peak arrives.
+			utils.Logger.Debugf("ValidatePositions: %q pre-peak, holding %s", pos.MarketQuestion, pos.Outcome)
 		} else if *outcome != pos.Outcome {
 			// Resolver now disagrees with our position
 			exitReason = fmt.Sprintf("resolver now says %s (we hold %s, confidence=%.0f%%)", *outcome, pos.Outcome, confidence*100)

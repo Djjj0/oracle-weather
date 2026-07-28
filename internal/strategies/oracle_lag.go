@@ -722,18 +722,25 @@ func (s *OracleLagStrategy) ExecuteOpportunity(ctx context.Context, opp Opportun
 	if priceMovement > MaxPriceMovement {
 		priceChangePercent := (priceMovement / opp.CurrentPrice) * 100
 
-		// Recalculate profit with new price
-		newExpectedProfit := (1.0 - currentPrice - PolymarketFee) * 100
+		// Recalculate edge with the new price, using the original confidence so
+		// this check is consistent with the edge gate in ScanOpportunities.
+		// The old formula (1.0 - price - fee) assumed 100% win probability and
+		// allowed continuation even when the real edge had turned negative after
+		// the price move. For example: conf=0.70, price moves 0.60→0.65 →
+		// old check passed (31.85% >> 3%), but true edge = 0.70-0.65-0.05 = 0%,
+		// negative after fees — a guaranteed loss on expectation.
+		newEdge := opp.Confidence - currentPrice - SlippageBuffer
+		newExpectedProfit := newEdge - PolymarketFee
 
 		// If still profitable, use the new price
-		if newExpectedProfit >= s.config.MinProfitThreshold*100 {
-			utils.Logger.Infof("⚠️  Price moved %.2f%% (%.2f → %.2f) but still profitable (%.2f%%), continuing...",
-				priceChangePercent, opp.CurrentPrice, currentPrice, newExpectedProfit)
+		if newExpectedProfit >= s.config.MinProfitThreshold {
+			utils.Logger.Infof("⚠️  Price moved %.2f%% (%.2f → %.2f) but still profitable (edge=%.1f%%), continuing...",
+				priceChangePercent, opp.CurrentPrice, currentPrice, newExpectedProfit*100)
 			opp.CurrentPrice = currentPrice
-			opp.ExpectedProfit = newExpectedProfit / 100 // Store as decimal
+			opp.ExpectedProfit = newExpectedProfit
 		} else {
-			utils.Logger.Warnf("⚠️  Price moved %.2f%% and no longer profitable: expected profit %.2f%% < threshold %.2f%%",
-				priceChangePercent, newExpectedProfit, s.config.MinProfitThreshold*100)
+			utils.Logger.Warnf("⚠️  Price moved %.2f%% and no longer profitable: edge=%.1f%% < threshold %.1f%%",
+				priceChangePercent, newExpectedProfit*100, s.config.MinProfitThreshold*100)
 			return fmt.Errorf("price moved and opportunity no longer profitable")
 		}
 	} else {
@@ -878,16 +885,20 @@ func (s *OracleLagStrategy) ExecuteOpportunity(ctx context.Context, opp Opportun
 			continue
 		}
 
-		// Recalculate profit with fresh price
-		newExpectedProfit := (1.0 - freshPrice - PolymarketFee) * 100
-		if newExpectedProfit >= s.config.MinProfitThreshold*100 {
-			utils.Logger.Infof("🔄 Retrying with updated price: $%.2f (profit: %.2f%%)", freshPrice, newExpectedProfit)
+		// Recalculate edge with fresh price and original confidence.
+		// Same fix as the pre-execution price-movement check above:
+		// (1.0 - price - fee) assumed 100% win probability and allowed
+		// retries when the true edge had already gone negative.
+		newEdge := opp.Confidence - freshPrice - SlippageBuffer
+		newExpectedProfit := newEdge - PolymarketFee
+		if newExpectedProfit >= s.config.MinProfitThreshold {
+			utils.Logger.Infof("🔄 Retrying with updated price: $%.2f (edge: %.1f%%)", freshPrice, newExpectedProfit*100)
 			opp.CurrentPrice = freshPrice
-			opp.ExpectedProfit = newExpectedProfit / 100
+			opp.ExpectedProfit = newExpectedProfit
 			// positionSize stays the same in USDC; sharesAmount will be recomputed next iteration
 		} else {
-			utils.Logger.Warnf("Fresh price $%.2f no longer profitable (%.2f%% < %.2f%%)",
-				freshPrice, newExpectedProfit, s.config.MinProfitThreshold*100)
+			utils.Logger.Warnf("Fresh price $%.2f no longer profitable (edge %.1f%% < threshold %.1f%%)",
+				freshPrice, newExpectedProfit*100, s.config.MinProfitThreshold*100)
 			return fmt.Errorf("opportunity no longer profitable after price update")
 		}
 	}
