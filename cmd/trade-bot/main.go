@@ -108,8 +108,9 @@ func main() {
 	// Run daily P&L report at 8am every morning
 	go runDailyReport(ctx, db, cfg, logger)
 
-	// Run nightly city_stats sanity audit at 7am local
-	go runCityStatsAudit(ctx, cfg, logger)
+	// Run nightly city_stats sanity audit at 7am local.
+	// Pass the factory's pre-opened DBs to avoid SQLITE_BUSY from concurrent opens.
+	go runCityStatsAudit(ctx, factory, cfg, logger)
 
 	runOracleLagStrategy(ctx, strategy, logger, cfg)
 }
@@ -121,7 +122,7 @@ func main() {
 // exact failure mode that drove Chicago's avg to 7.46 and triggered ~$280 of
 // premature temperature_range NO bets. Alerts go to Discord so the operator
 // can quarantine the bad row before the next trading window.
-func runCityStatsAudit(ctx context.Context, cfg *config.Config, logger *logrus.Logger) {
+func runCityStatsAudit(ctx context.Context, factory *resolvers.Factory, cfg *config.Config, logger *logrus.Logger) {
 	for {
 		now := time.Now()
 		next := time.Date(now.Year(), now.Month(), now.Day(), 7, 0, 0, 0, now.Location())
@@ -137,11 +138,11 @@ func runCityStatsAudit(ctx context.Context, cfg *config.Config, logger *logrus.L
 		case <-time.After(wait):
 		}
 
-		auditCityStats(cfg, logger)
+		auditCityStats(factory.GetLearningDB(), factory.GetIntlDB(), cfg, logger)
 	}
 }
 
-func auditCityStats(cfg *config.Config, logger *logrus.Logger) {
+func auditCityStats(usDB, intlDB *pkgweather.LearningDB, cfg *config.Config, logger *logrus.Logger) {
 	const minHour, maxHour = 10.0, 20.0
 	type finding struct {
 		source  string
@@ -154,18 +155,16 @@ func auditCityStats(cfg *config.Config, logger *logrus.Logger) {
 
 	for _, src := range []struct {
 		name string
-		path string
+		db   *pkgweather.LearningDB
 	}{
-		{"US", "./data/learning.db"},
-		{"INTL", "./data/learning_international.db"},
+		{"US", usDB},
+		{"INTL", intlDB},
 	} {
-		ldb, err := pkgweather.NewLearningDB(src.path)
-		if err != nil {
-			logger.Errorf("City stats audit: failed to open %s (%s): %v", src.name, src.path, err)
+		if src.db == nil {
+			logger.Warnf("City stats audit: %s learning DB not available — skipping", src.name)
 			continue
 		}
-		stats, err := ldb.GetAllCityStats()
-		_ = ldb.Close()
+		stats, err := src.db.GetAllCityStats()
 		if err != nil {
 			logger.Errorf("City stats audit: failed to read %s: %v", src.name, err)
 			continue

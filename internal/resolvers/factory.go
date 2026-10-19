@@ -116,3 +116,13 @@ func (f *Factory) GetAllResolvers() []Resolver {
 		NewIEMWeatherResolverWithDBs(f.config, f.learningDB, f.intlDB),
 	}
 }
+
+// GetLearningDB returns the US learning DB opened at factory construction time.
+func (f *Factory) GetLearningDB() *pkgweather.LearningDB {
+	return f.learningDB
+}
+
+// GetIntlDB returns the international learning DB opened at factory construction time.
+func (f *Factory) GetIntlDB() *pkgweather.LearningDB {
+	return f.intlDB
+}
