@@ -1082,14 +1082,10 @@ func (s *OracleLagStrategy) calculatePositionSize(confidence, currentPrice float
 	}
 
 	// Below Polymarket's $5 minimum: skip, do not force-size up to $5.
-	// (Forcing $5 when the cap said $4.46 is allowed would systematically
-	// overbet on small bankrolls — the audit premise is that we'd rather
-	// sit out than overexpose.)
+	// Rain markets are NOT exempted here: RainMaxPosition defaults to $1.00 as a
+	// testing suppression cap, and returning $1.00 would cause ExecuteOpportunity's
+	// 5-share minimum check to bump it to $5 — defeating the cap. Skip instead.
 	if finalSize < 5.0 {
-		// Exception: rain markets allow sub-$5 via their own cap mechanism.
-		if strings.Contains(strings.ToLower(marketQuestion), "rain") {
-			return finalSize
-		}
 		return 0
 	}
 
