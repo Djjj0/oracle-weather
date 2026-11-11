@@ -3,6 +3,7 @@ package strategies
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/djbro/oracle-weather/internal/config"
@@ -239,10 +240,12 @@ func (pc *PositionCloser) ValidateAndExitBadPositions(ctx context.Context) error
 		shouldExit := false
 
 		if outcome == nil {
-			// Resolver says it's too early to know (pre-peak) — position was placed prematurely
-			exitReason = "placed before peak hour — resolver cannot confirm outcome yet"
-			shouldExit = true
-		} else if *outcome != pos.Outcome {
+			// Pre-peak — resolver can't confirm yet. Keep the position.
+			// We only exit when the resolver ACTIVELY returns the opposite outcome.
+			// Exiting on nil would prematurely close valid positions placed correctly
+			// but scanned before the city's peak hour window opens.
+			utils.Logger.Debugf("ValidatePositions: %q pre-peak, holding %s", pos.MarketQuestion, pos.Outcome)
+		} else if !strings.EqualFold(*outcome, pos.Outcome) {
 			// Resolver now disagrees with our position
 			exitReason = fmt.Sprintf("resolver now says %s (we hold %s, confidence=%.0f%%)", *outcome, pos.Outcome, confidence*100)
 			shouldExit = true
